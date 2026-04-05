@@ -1,15 +1,15 @@
 [package]
-name = "tg-rcore-tutorial-ch8"
-description = "Chapter 8 of rCore Tutorial: Concurrency with threads, mutex, semaphore and condvar."
-version = "0.4.8"
+name = "tg-rcore-tutorial-ch8-yks23"
+description = "rCore Tutorial ch8 (threads / mutex / semaphore), fork suffix yks23 for crates.io."
+version = "0.4.8-preview.1"
 edition = "2024"
 authors = ["YdrMaster <ydrml@hotmail.com>", "Yifan Wang <w-yf22@mails.tsinghua.edu.cn>", "Yu Chen <yuchen@tsinghua.edu.cn>"]
-repository = "https://github.com/rcore-os/tg-rcore-tutorial-ch8"
-homepage = "https://github.com/rcore-os/tg-rcore-tutorial-ch8/tree/test"
-documentation = "https://docs.rs/tg-rcore-tutorial-ch8"
+repository = "https://github.com/yks23/tg-rcore-tutorial"
+homepage = "https://github.com/yks23/tg-rcore-tutorial/tree/test/tg-rcore-tutorial-ch8"
+documentation = "https://docs.rs/tg-rcore-tutorial-ch8-yks23"
 license = "GPL-3.0"
 readme = "README.md"
-keywords = ["rcore", "tutorial", "no-std", "riscv", "concurrency"]
+keywords = ["ai", "ai4ose", "kernel", "learning", "os"]
 categories = ["no-std", "embedded"]
 exclude = [
     "tg-user/**",
