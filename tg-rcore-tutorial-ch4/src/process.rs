@@ -22,6 +22,7 @@
 use crate::{build_flags, parse_flags, Sv39, Sv39Manager};
 use alloc::alloc::alloc_zeroed;
 use core::alloc::Layout;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use tg_console::log;
 use tg_kernel_context::{foreign::ForeignContext, LocalContext};
 use tg_kernel_vm::{
@@ -32,6 +33,31 @@ use xmas_elf::{
     header::{self, HeaderPt2, Machine},
     program, ElfFile,
 };
+
+/// 与 `SyscallId` 数值兼容的计数表长度
+pub const SYSCALL_COUNT_LEN: usize = 512;
+
+static ACTIVE_SYSCALL_COUNTS: AtomicUsize = AtomicUsize::new(0);
+
+/// 在处理系统调用期间注册当前进程的 `syscall_counts`，供 `trace` 查询
+#[inline]
+pub fn set_active_syscall_counts(ptr: *mut [u32; SYSCALL_COUNT_LEN]) {
+    ACTIVE_SYSCALL_COUNTS.store(ptr as usize, Ordering::SeqCst);
+}
+
+#[inline]
+pub fn clear_active_syscall_counts() {
+    ACTIVE_SYSCALL_COUNTS.store(0, Ordering::SeqCst);
+}
+
+#[inline]
+pub fn with_active_syscall_counts<R>(f: impl FnOnce(&mut [u32; SYSCALL_COUNT_LEN]) -> R) -> Option<R> {
+    let p = ACTIVE_SYSCALL_COUNTS.load(Ordering::SeqCst);
+    if p == 0 {
+        return None;
+    }
+    Some(f(unsafe { &mut *(p as *mut [u32; SYSCALL_COUNT_LEN]) }))
+}
 
 /// 进程结构体
 ///
@@ -49,6 +75,8 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶）
     pub program_brk: usize,
+    /// 各系统调用号调用次数（与 ch3 `trace` 练习一致）
+    pub syscall_counts: [u32; SYSCALL_COUNT_LEN],
 }
 
 impl Process {
@@ -150,6 +178,7 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            syscall_counts: [0; SYSCALL_COUNT_LEN],
         })
     }
 
