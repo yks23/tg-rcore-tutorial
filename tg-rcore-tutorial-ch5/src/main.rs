@@ -250,21 +250,27 @@ extern "C" fn rust_main() -> ! {
                 // ─── 系统调用（ecall 指令触发） ───
                 scause::Trap::Exception(scause::Exception::UserEnvCall) => {
                     use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
-                    let ctx = &mut task.context.context;
-                    // 将 sepc 向前移动 4 字节，使返回用户态时跳过 ecall 指令
-                    ctx.move_next();
-                    // 解析系统调用号和参数
-                    let id: Id = ctx.a(7).into();
-                    let args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
+                    let id: Id;
+                    let args: [usize; 6];
+                    {
+                        let ctx = &mut task.context.context;
+                        // 将 sepc 向前移动 4 字节，使返回用户态时跳过 ecall 指令
+                        ctx.move_next();
+                        id = ctx.a(7).into();
+                        args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
+                    }
                     // 分发并处理系统调用
                     match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
                         Ret::Done(ret) => match id {
                             // exit 系统调用：标记当前进程为已退出
                             Id::EXIT => unsafe { (*processor).make_current_exited(ret) },
                             _ => {
-                                // 其他系统调用：将返回值写入 a0 寄存器，暂停当前进程
-                                let ctx = &mut task.context.context;
-                                *ctx.a_mut(0) = ret as _;
+                                // Stride：本时间片结束，累加 pass = BIG_STRIDE / priority
+                                const STRIDE_BIG: usize = 0x1000_0000;
+                                *task.context.context.a_mut(0) = ret as _;
+                                task.stride = task
+                                    .stride
+                                    .wrapping_add(STRIDE_BIG / task.priority.max(1));
                                 unsafe { (*processor).make_current_suspend() };
                             }
                         },
@@ -365,7 +371,8 @@ fn map_portal(space: &AddressSpace<Sv39, Sv39Manager>) {
 /// 包括 IO、Process、Scheduling、Clock、Memory 等系统调用接口。
 mod impls {
     use crate::{
-        build_flags, process::Process as ProcStruct, processor::ProcManager, Sv39, APPS, PROCESSOR,
+        build_flags, parse_flags, process::Process as ProcStruct, processor::ProcManager, Sv39,
+        APPS, PROCESSOR,
     };
     use alloc::alloc::alloc_zeroed;
     use core::{alloc::Layout, ptr::NonNull};
@@ -642,15 +649,26 @@ mod impls {
         ///
         /// 与 fork+exec 不同，spawn 直接从 ELF 创建新进程，
         /// 无需复制父进程地址空间。
-        ///
-        /// TODO: 实现 spawn 系统调用（练习题）
-        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {
-            let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "spawn: parent pid = {}, not implemented",
-                current.pid.get_usize()
-            );
-            -1
+        fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let current = unsafe { (*processor).current().unwrap() };
+            let parent_pid = current.pid;
+            current
+                .address_space
+                .translate::<u8>(VAddr::new(path), READABLE)
+                .map(|ptr| unsafe {
+                    core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
+                })
+                .and_then(|name| APPS.get(name))
+                .and_then(|input| ElfFile::new(input).ok())
+                .and_then(ProcStruct::from_elf)
+                .map(|child| {
+                    let pid = child.pid;
+                    unsafe { (*processor).add(pid, child, parent_pid) };
+                    pid.get_usize() as isize
+                })
+                .unwrap_or(-1)
         }
 
         /// sbrk 系统调用：调整进程堆空间大小
@@ -677,16 +695,13 @@ mod impls {
         }
 
         /// set_priority 系统调用：设置当前进程优先级
-        ///
-        /// TODO: 实现 set_priority 系统调用（练习题：stride 调度算法）
         fn set_priority(&self, _caller: Caller, prio: isize) -> isize {
+            if prio < 2 {
+                return -1;
+            }
             let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "set_priority: pid = {}, prio = {}, not implemented",
-                current.pid.get_usize(),
-                prio
-            );
-            -1
+            current.priority = prio as usize;
+            prio
         }
     }
 
@@ -726,9 +741,6 @@ mod impls {
 
     /// 内存管理系统调用实现
     impl Memory for SyscallContext {
-        /// mmap 系统调用：映射匿名内存
-        ///
-        /// TODO: 实现 mmap 系统调用（练习题）
         fn mmap(
             &self,
             _caller: Caller,
@@ -739,19 +751,102 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            const PAGE: usize = 1 << Sv39::PAGE_BITS;
+            if addr & (PAGE - 1) != 0 || addr >> 38 != 0 {
+                return -1;
+            }
+            let Ok(vm_flags) = mmap_prot_to_flags(prot) else {
+                return -1;
+            };
+            let alen = if len == 0 {
+                0usize
+            } else {
+                (len + PAGE - 1) / PAGE * PAGE
+            };
+            let Some(end_v) = addr.checked_add(alen) else {
+                return -1;
+            };
+            if end_v >> 38 != 0 {
+                return -1;
+            }
+            let vpn_s = VAddr::new(addr).floor();
+            let vpn_e = VAddr::new(end_v).ceil();
+            if vpn_s >= vpn_e {
+                return 0;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let mut v = vpn_s;
+            while v < vpn_e {
+                if current
+                    .address_space
+                    .translate::<u8>(v.base(), READABLE)
+                    .is_some()
+                {
+                    return -1;
+                }
+                v = v + 1;
+            }
+            current
+                .address_space
+                .map(vpn_s..vpn_e, &[], 0, vm_flags);
+            0
         }
 
-        /// munmap 系统调用：取消内存映射
-        ///
-        /// TODO: 实现 munmap 系统调用（练习题）
         fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+            const PAGE: usize = 1 << Sv39::PAGE_BITS;
+            if addr & (PAGE - 1) != 0 || addr >> 38 != 0 {
+                return -1;
+            }
+            let alen = if len == 0 {
+                0usize
+            } else {
+                (len + PAGE - 1) / PAGE * PAGE
+            };
+            let Some(end_v) = addr.checked_add(alen) else {
+                return -1;
+            };
+            if end_v >> 38 != 0 {
+                return -1;
+            }
+            let vpn_s = VAddr::new(addr).floor();
+            let vpn_e = VAddr::new(end_v).ceil();
+            if vpn_s >= vpn_e {
+                return 0;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let mut v = vpn_s;
+            while v < vpn_e {
+                if current
+                    .address_space
+                    .translate::<u8>(v.base(), READABLE)
+                    .is_none()
+                {
+                    return -1;
+                }
+                v = v + 1;
+            }
+            current.address_space.unmap(vpn_s..vpn_e);
+            0
         }
+    }
+
+    fn mmap_prot_to_flags(prot: i32) -> Result<VmFlags<Sv39>, ()> {
+        if prot & !0x7 != 0 || prot & 0x7 == 0 {
+            return Err(());
+        }
+        let mut f = *b"U___V";
+        if prot & 1 != 0 {
+            f[1] = b'R';
+        }
+        if prot & 2 != 0 {
+            f[2] = b'W';
+        }
+        if prot & 4 != 0 {
+            f[3] = b'X';
+        }
+        parse_flags(unsafe { core::str::from_utf8_unchecked(&f) })
     }
 }
 

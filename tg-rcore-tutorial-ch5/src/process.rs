@@ -50,6 +50,10 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶），通过 sbrk 调整
     pub program_brk: usize,
+    /// Stride 调度：当前累计 stride
+    pub stride: usize,
+    /// Stride 调度：优先级（≥2），越大分得 CPU 越多
+    pub priority: usize,
 }
 
 impl Process {
@@ -63,6 +67,8 @@ impl Process {
         self.context = proc.context;
         self.heap_bottom = proc.heap_bottom;
         self.program_brk = proc.program_brk;
+        self.stride = proc.stride;
+        self.priority = proc.priority;
     }
 
     /// fork 系统调用的核心实现：复制当前进程创建子进程
@@ -89,6 +95,8 @@ impl Process {
             address_space,
             heap_bottom: self.heap_bottom,
             program_brk: self.program_brk,
+            stride: self.stride,
+            priority: self.priority,
         })
     }
 
@@ -192,6 +200,8 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            stride: 0,
+            priority: 16,
         })
     }
 
