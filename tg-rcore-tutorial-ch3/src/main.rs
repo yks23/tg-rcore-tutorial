@@ -54,6 +54,10 @@ core::arch::global_asm!(include_str!(env!("APP_ASM")));
 // 最大支持的应用程序数量
 const APP_CAPACITY: usize = 32;
 
+/// 任务控制块表放在静态存储区，避免在 `rust_main` 栈上分配
+/// `32 × (用户栈 8KiB + syscall 计数表等)` 导致栈溢出。
+static mut KERNEL_TCBS: [TaskControlBlock; APP_CAPACITY] = [TaskControlBlock::ZERO; APP_CAPACITY];
+
 // 定义内核入口点：分配 (APP_CAPACITY + 2) * 8 KiB = 272 KiB 的内核栈
 // 比第二章更大，因为需要同时容纳多个任务的内核上下文。
 //
@@ -104,7 +108,7 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_trace(&SyscallContext);
 
     // 第四步：初始化任务控制块数组，加载所有用户程序
-    let mut tcbs = [TaskControlBlock::ZERO; APP_CAPACITY];
+    let tcbs = unsafe { &mut KERNEL_TCBS[..] };
     let mut index_mod = 0;
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
         let entry = app.as_ptr() as usize;
@@ -149,7 +153,7 @@ extern "C" fn rust_main() -> ! {
                     // ─── 系统调用：用户程序执行了 ecall 指令 ───
                     Trap::Exception(Exception::UserEnvCall) => {
                         use task::SchedulingEvent as Event;
-                        match tcb.handle_syscall() {
+                        match tcb.handle_syscall(i) {
                             // 普通系统调用（如 write）：处理完成后继续运行当前任务
                             Event::None => continue,
                             // exit 系统调用：任务主动退出
@@ -306,12 +310,31 @@ mod impls {
         fn trace(
             &self,
             _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
+            trace_request: usize,
+            id: usize,
+            data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+            match trace_request {
+                0 => {
+                    // 读取当前任务用户地址 id 处一字节
+                    unsafe { *{ id as *const u8 } as isize }
+                }
+                1 => {
+                    // 写入 (data 低 8 位) 到用户地址 id
+                    unsafe {
+                        *(id as *mut u8) = data as u8;
+                    }
+                    0
+                }
+                2 => {
+                    if id >= crate::task::SYSCALL_COUNT_LEN {
+                        return -1;
+                    }
+                    crate::task::with_active_syscall_counts(|counts| counts[id] as isize)
+                        .unwrap_or(-1)
+                }
+                _ => -1,
+            }
         }
     }
 }

@@ -40,7 +40,7 @@ run_base() {
     # - cargo run 2>&1：合并 stdout 和 stderr（包含编译信息和运行输出）
     # - tee /dev/stderr：将输出复制一份到 stderr（显示在终端），原始流继续通过管道
     # - tg-rcore-tutorial-checker --ch 3：接收管道中的输出进行检查
-    if cargo run 2>&1 | tee /dev/stderr | tg-rcore-tutorial-checker --ch 3; then
+    if cargo run 2>&1 | { tee /dev/stderr 2>/dev/null || :; } | tg-rcore-tutorial-checker --ch 3; then
         echo ""
         echo -e "${YELLOW}────────── 测试结果 ──────────${NC}"
         echo -e "${GREEN}✓ ch3 基础测试通过${NC}"
@@ -57,7 +57,7 @@ run_exercise() {
     echo "运行 ch3 练习测试..."
     echo -e "${YELLOW}────────── cargo run --features exercise 输出 ──────────${NC}"
 
-    if cargo run --features exercise 2>&1 | tee /dev/stderr | tg-rcore-tutorial-checker --ch 3 --exercise; then
+    if cargo run --features exercise 2>&1 | { tee /dev/stderr 2>/dev/null || :; } | tg-rcore-tutorial-checker --ch 3 --exercise; then
         echo ""
         echo -e "${YELLOW}────────── 测试结果 ──────────${NC}"
         echo -e "${GREEN}✓ ch3 练习测试通过${NC}"
