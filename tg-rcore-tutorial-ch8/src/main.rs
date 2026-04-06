@@ -48,6 +48,8 @@
 
 /// 文件系统模块：easy-fs 封装 + 统一 Fd 枚举
 mod fs;
+/// 死锁检测（银行家算法）
+mod deadlock;
 /// 进程与线程模块：Process（资源容器）和 Thread（执行单元）
 mod process;
 /// 处理器模块：PROCESSOR 全局管理器（PThreadManager）
@@ -737,8 +739,8 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
             let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
-            if let Some(tid) = sem.up() {
-                unsafe { (*processor).re_enque(tid); }
+            if let Some(wake) = sem.up() {
+                unsafe { (*processor).re_enque(wake); }
             }
             0
         }
@@ -748,9 +750,22 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
-            if !sem.down(tid) { -1 } else { 0 }
+            unsafe {
+                let (detect, pid) = {
+                    let p = (*processor).get_current_proc().unwrap();
+                    (p.deadlock_detect, p.pid)
+                };
+                if detect {
+                    let threads = (*processor).get_thread(pid).unwrap().clone();
+                    let proc = (*processor).get_current_proc().unwrap();
+                    if !crate::deadlock::check_semaphore_down_safe(proc, sem_id, tid, &threads) {
+                        return crate::deadlock::DEADLOCK_RET;
+                    }
+                }
+                let proc = (*processor).get_current_proc().unwrap();
+                let sem = Arc::clone(proc.semaphore_list[sem_id].as_ref().unwrap());
+                if !sem.down(tid) { -1 } else { 0 }
+            }
         }
 
         /// 创建互斥锁（blocking=true 为阻塞锁）
@@ -786,9 +801,22 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
-            if !mutex.lock(tid) { -1 } else { 0 }
+            unsafe {
+                let (detect, pid) = {
+                    let p = (*processor).get_current_proc().unwrap();
+                    (p.deadlock_detect, p.pid)
+                };
+                if detect {
+                    let threads = (*processor).get_thread(pid).unwrap().clone();
+                    let proc = (*processor).get_current_proc().unwrap();
+                    if !crate::deadlock::check_mutex_lock_safe(proc, mutex_id, tid, &threads) {
+                        return crate::deadlock::DEADLOCK_RET;
+                    }
+                }
+                let proc = (*processor).get_current_proc().unwrap();
+                let mutex = Arc::clone(proc.mutex_list[mutex_id].as_ref().unwrap());
+                if !mutex.lock(tid) { -1 } else { 0 }
+            }
         }
 
         /// 创建条件变量
@@ -832,10 +860,14 @@ mod impls {
             if !flag { -1 } else { 0 }
         }
 
-        /// 死锁检测（TODO 练习题）
+        /// 死锁检测开关（练习）
         fn enable_deadlock_detect(&self, _caller: Caller, is_enable: i32) -> isize {
-            tg_console::log::info!("enable_deadlock_detect: is_enable = {is_enable}, not implemented");
-            -1
+            if is_enable != 0 && is_enable != 1 {
+                return -1;
+            }
+            let proc = PROCESSOR.get_mut().get_current_proc().unwrap();
+            proc.deadlock_detect = is_enable == 1;
+            0
         }
     }
 }

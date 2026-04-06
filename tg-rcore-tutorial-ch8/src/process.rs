@@ -84,6 +84,8 @@ pub struct Process {
     pub mutex_list: Vec<Option<Arc<dyn MutexTrait>>>,
     /// 条件变量列表（**本章新增**，所有线程共享）
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// 是否启用死锁预判（练习）
+    pub deadlock_detect: bool,
 }
 
 impl Process {
@@ -134,6 +136,7 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                deadlock_detect: false,
             },
             thread,
         ))
@@ -206,6 +209,7 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                deadlock_detect: false,
             },
             thread,
         ))
