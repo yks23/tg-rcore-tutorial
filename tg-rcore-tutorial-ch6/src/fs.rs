@@ -82,14 +82,14 @@ impl FSManager for FileSystem {
         Some(self.root.readdir())
     }
 
-    /// 创建硬链接（TODO 练习题）
+    /// 与 crates.io 上 `tg-rcore-tutorial-easy-fs` 0.4.8 对齐：`Inode` 无 `link`/`unlink` 实现。
+    /// 完整硬链接逻辑见仓库内本地 `easy-fs` 扩展；若走「方案 A」发布自研 easy-fs 后可改为委托 `self.root`。
     fn link(&self, _src: &str, _dst: &str) -> isize {
-        unimplemented!()
+        -1
     }
 
-    /// 删除硬链接（TODO 练习题）
     fn unlink(&self, _path: &str) -> isize {
-        unimplemented!()
+        -1
     }
 }
 

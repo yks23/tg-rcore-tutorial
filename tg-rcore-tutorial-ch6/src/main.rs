@@ -217,16 +217,23 @@ extern "C" fn rust_main() -> ! {
                 // ─── 系统调用（ecall 指令触发） ───
                 scause::Trap::Exception(scause::Exception::UserEnvCall) => {
                     use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
-                    let ctx = &mut task.context.context;
-                    ctx.move_next();
-                    let id: Id = ctx.a(7).into();
-                    let args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
+                    let id: Id;
+                    let args: [usize; 6];
+                    {
+                        let ctx = &mut task.context.context;
+                        ctx.move_next();
+                        id = ctx.a(7).into();
+                        args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
+                    }
                     match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
                         Ret::Done(ret) => match id {
                             Id::EXIT => unsafe { (*processor).make_current_exited(ret) },
                             _ => {
-                                let ctx = &mut task.context.context;
-                                *ctx.a_mut(0) = ret as _;
+                                const STRIDE_BIG: usize = 0x1000_0000;
+                                *task.context.context.a_mut(0) = ret as _;
+                                task.stride = task
+                                    .stride
+                                    .wrapping_add(STRIDE_BIG / task.priority.max(1));
                                 unsafe { (*processor).make_current_suspend() };
                             }
                         },
@@ -340,7 +347,7 @@ fn map_portal(space: &AddressSpace<Sv39, Sv39Manager>) {
 /// - `linkat`/`unlinkat`/`fstat`：硬链接相关（TODO 练习题）
 mod impls {
     use crate::{
-        build_flags,
+        build_flags, parse_flags,
         fs::{read_all, FS},
         process::Process as ProcStruct,
         processor::ProcManager,
@@ -580,36 +587,61 @@ mod impls {
         }
 
         /// linkat 系统调用：创建硬链接
-        ///
-        /// TODO: 实现 linkat 系统调用（练习题）
         fn linkat(
             &self,
             _caller: Caller,
             _olddirfd: i32,
-            _oldpath: usize,
+            oldpath: usize,
             _newdirfd: i32,
-            _newpath: usize,
+            newpath: usize,
             _flags: u32,
         ) -> isize {
-            tg_console::log::info!("linkat: not implemented");
-            -1
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let Some(old) = read_user_path(current, oldpath) else {
+                return -1;
+            };
+            let Some(new) = read_user_path(current, newpath) else {
+                return -1;
+            };
+            FS.link(old.as_str(), new.as_str())
         }
 
         /// unlinkat 系统调用：删除硬链接
-        ///
-        /// TODO: 实现 unlinkat 系统调用（练习题）
-        fn unlinkat(&self, _caller: Caller, _dirfd: i32, _path: usize, _flags: u32) -> isize {
-            tg_console::log::info!("unlinkat: not implemented");
-            -1
+        fn unlinkat(&self, _caller: Caller, _dirfd: i32, path: usize, _flags: u32) -> isize {
+            let current = PROCESSOR.get_mut().current().unwrap();
+            let Some(p) = read_user_path(current, path) else {
+                return -1;
+            };
+            FS.unlink(p.as_str())
         }
 
         /// fstat 系统调用：获取文件状态
         ///
-        /// TODO: 实现 fstat 系统调用（练习题）
+        /// crates.io 上 `tg-rcore-tutorial-easy-fs` 0.4.8 的 `Inode` 无 `stat_meta`；与 registry 对齐时返回不支持。
+        /// 使用本地扩展 easy-fs + 方案 A 发布自研 crate 后可恢复填充 `Stat`。
         fn fstat(&self, _caller: Caller, _fd: usize, _st: usize) -> isize {
-            tg_console::log::info!("fstat: not implemented");
             -1
         }
+    }
+
+    /// 从用户空间读取以 `\0` 结尾的路径（与 `open` 一致）
+    fn read_user_path(current: &crate::process::Process, path: usize) -> Option<String> {
+        let ptr = current
+            .address_space
+            .translate::<u8>(VAddr::new(path), READABLE)?;
+        let mut string = String::new();
+        let mut raw_ptr = ptr.as_ptr();
+        loop {
+            unsafe {
+                let ch = *raw_ptr;
+                if ch == 0 {
+                    break;
+                }
+                string.push(ch as char);
+                raw_ptr = raw_ptr.add(1);
+            }
+        }
+        Some(string)
     }
 
     /// 进程管理系统调用实现（与第五章基本相同）
@@ -693,14 +725,33 @@ mod impls {
             current.pid.get_usize() as _
         }
 
-        /// spawn 系统调用（TODO 练习题）
-        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {
-            let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "spawn: parent pid = {}, not implemented",
-                current.pid.get_usize()
-            );
-            -1
+        fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let current = unsafe { (*processor).current().unwrap() };
+            let parent_pid = current.pid;
+            let Some(ptr) = current
+                .address_space
+                .translate::<u8>(VAddr::new(path), READABLE)
+            else {
+                return -1;
+            };
+            let name = unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
+            };
+            let Some(fd) = FS.open(name, OpenFlags::RDONLY) else {
+                return -1;
+            };
+            let data = read_all(fd);
+            let Ok(elf) = ElfFile::new(data.as_slice()) else {
+                return -1;
+            };
+            let Some(child) = ProcStruct::from_elf(elf) else {
+                return -1;
+            };
+            let pid = child.pid;
+            unsafe { (*processor).add(pid, child, parent_pid) };
+            pid.get_usize() as isize
         }
 
         /// sbrk 系统调用：调整堆大小
@@ -721,15 +772,13 @@ mod impls {
             0
         }
 
-        /// set_priority 系统调用（TODO 练习题）
         fn set_priority(&self, _caller: Caller, prio: isize) -> isize {
+            if prio < 2 {
+                return -1;
+            }
             let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "set_priority: pid = {}, prio = {}, not implemented",
-                current.pid.get_usize(),
-                prio
-            );
-            -1
+            current.priority = prio as usize;
+            prio
         }
     }
 
@@ -765,7 +814,6 @@ mod impls {
 
     /// 内存管理系统调用实现
     impl Memory for SyscallContext {
-        /// mmap 系统调用（TODO 练习题）
         fn mmap(
             &self,
             _caller: Caller,
@@ -776,17 +824,102 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            const PAGE: usize = 1 << Sv39::PAGE_BITS;
+            if addr & (PAGE - 1) != 0 || addr >> 38 != 0 {
+                return -1;
+            }
+            let Ok(vm_flags) = mmap_prot_to_flags(prot) else {
+                return -1;
+            };
+            let alen = if len == 0 {
+                0usize
+            } else {
+                (len + PAGE - 1) / PAGE * PAGE
+            };
+            let Some(end_v) = addr.checked_add(alen) else {
+                return -1;
+            };
+            if end_v >> 38 != 0 {
+                return -1;
+            }
+            let vpn_s = VAddr::new(addr).floor();
+            let vpn_e = VAddr::new(end_v).ceil();
+            if vpn_s >= vpn_e {
+                return 0;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let mut v = vpn_s;
+            while v < vpn_e {
+                if current
+                    .address_space
+                    .translate::<u8>(v.base(), READABLE)
+                    .is_some()
+                {
+                    return -1;
+                }
+                v = v + 1;
+            }
+            current
+                .address_space
+                .map(vpn_s..vpn_e, &[], 0, vm_flags);
+            0
         }
 
-        /// munmap 系统调用（TODO 练习题）
         fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+            const PAGE: usize = 1 << Sv39::PAGE_BITS;
+            if addr & (PAGE - 1) != 0 || addr >> 38 != 0 {
+                return -1;
+            }
+            let alen = if len == 0 {
+                0usize
+            } else {
+                (len + PAGE - 1) / PAGE * PAGE
+            };
+            let Some(end_v) = addr.checked_add(alen) else {
+                return -1;
+            };
+            if end_v >> 38 != 0 {
+                return -1;
+            }
+            let vpn_s = VAddr::new(addr).floor();
+            let vpn_e = VAddr::new(end_v).ceil();
+            if vpn_s >= vpn_e {
+                return 0;
+            }
+            let current = PROCESSOR.get_mut().current().unwrap();
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let mut v = vpn_s;
+            while v < vpn_e {
+                if current
+                    .address_space
+                    .translate::<u8>(v.base(), READABLE)
+                    .is_none()
+                {
+                    return -1;
+                }
+                v = v + 1;
+            }
+            current.address_space.unmap(vpn_s..vpn_e);
+            0
         }
+    }
+
+    fn mmap_prot_to_flags(prot: i32) -> Result<VmFlags<Sv39>, ()> {
+        if prot & !0x7 != 0 || prot & 0x7 == 0 {
+            return Err(());
+        }
+        let mut f = *b"U___V";
+        if prot & 1 != 0 {
+            f[1] = b'R';
+        }
+        if prot & 2 != 0 {
+            f[2] = b'W';
+        }
+        if prot & 4 != 0 {
+            f[3] = b'X';
+        }
+        parse_flags(unsafe { core::str::from_utf8_unchecked(&f) })
     }
 }
 

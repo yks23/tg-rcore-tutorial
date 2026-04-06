@@ -75,12 +75,30 @@ impl Manage<Process, ProcId> for ProcManager {
 }
 
 impl Schedule<ProcId> for ProcManager {
-    /// 加入就绪队列尾部
     fn add(&mut self, id: ProcId) {
         self.ready_queue.push_back(id);
     }
-    /// 从就绪队列头部取出
+
     fn fetch(&mut self) -> Option<ProcId> {
-        self.ready_queue.pop_front()
+        let len = self.ready_queue.len();
+        if len == 0 {
+            return None;
+        }
+        let mut best_i = 0usize;
+        let mut best_id = self.ready_queue[0];
+        let mut best_stride = self.tasks.get(&best_id).map(|p| p.stride).unwrap_or(usize::MAX);
+        for i in 1..len {
+            let id = self.ready_queue[i];
+            let stride = self.tasks.get(&id).unwrap().stride;
+            if stride < best_stride
+                || (stride == best_stride && id.get_usize() < best_id.get_usize())
+            {
+                best_i = i;
+                best_id = id;
+                best_stride = stride;
+            }
+        }
+        self.ready_queue.remove(best_i);
+        Some(best_id)
     }
 }
