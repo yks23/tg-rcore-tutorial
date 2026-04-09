@@ -7,6 +7,8 @@
 fn main() {
     use std::{env, fs, path::PathBuf};
 
+    write_qemu_smp();
+
     // 仅在交叉编译到 RISC-V64 时生成链接脚本
     if env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default() == "riscv64" {
         let ld = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("linker.ld");
@@ -14,6 +16,23 @@ fn main() {
         // 告诉 rustc 使用此链接脚本
         println!("cargo:rustc-link-arg=-T{}", ld.display());
     }
+}
+
+/// 写入 `OUT_DIR/qemu_smp.rs`，供 `main.rs` `include!`；与 QEMU 脚本 `RCORE_SMP` 对齐（验收单核/多核开关）。
+fn write_qemu_smp() {
+    use std::{env, fs, path::PathBuf};
+
+    println!("cargo:rerun-if-env-changed=RCORE_SMP");
+    let n = env::var("RCORE_SMP").unwrap_or_else(|_| "8".to_string());
+    let n: usize = n.parse().unwrap_or(8).clamp(1, 8);
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("qemu_smp.rs");
+    fs::write(
+        &out,
+        format!(
+            "/// QEMU `-smp` 核数（构建时 `RCORE_SMP`，默认 8，与 `scripts/qemu-virt-kernel.sh` 一致）。\npub const QEMU_SMP: usize = {n};\n"
+        ),
+    )
+    .unwrap();
 }
 
 /// 链接脚本内容。

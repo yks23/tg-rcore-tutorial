@@ -32,7 +32,7 @@ echo -e "${YELLOW}────────── cargo run 输出 ────�
 # - tg-rcore-tutorial-checker --ch 2：接收管道中的输出进行检查
 # 使用 pipefail 确保管道中任意命令失败都能被捕获
 set -o pipefail
-if cargo run 2>&1 | tee /dev/stderr | tg-rcore-tutorial-checker --ch 2; then
+if cargo run 2>&1 | { tee /dev/stderr 2>/dev/null || :; } | tg-rcore-tutorial-checker --ch 2; then
     echo ""
     echo -e "${YELLOW}────────── 测试结果 ──────────${NC}"
     echo -e "${GREEN}✓ ch2 基础测试通过${NC}"

@@ -26,7 +26,35 @@
 
 // 引入 SBI 调用库，提供 console_putchar（输出字符）和 shutdown（关机）功能
 // 启用 nobios 特性后，tg_sbi 内建了 M-mode 启动代码，无需外部 SBI 固件
-use tg_sbi::{console_putchar, shutdown};
+#[cfg(target_arch = "riscv64")]
+include!(concat!(env!("OUT_DIR"), "/qemu_smp.rs"));
+
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(target_arch = "riscv64")]
+use tg_sbi::console_putchar;
+use tg_sbi::shutdown;
+
+/// 串口逐字输出无原子性，多核同时写会交错；实验 9 验收时用自旋锁串行化整段输出。
+#[cfg(target_arch = "riscv64")]
+static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// 已完成「副核上线」一行的 hart 数量（hart 0 等待到 `QEMU_SMP - 1` 再打印并关机；`QEMU_SMP=1` 时不等待）。
+#[cfg(target_arch = "riscv64")]
+static SECONDARIES_PRINTED: AtomicUsize = AtomicUsize::new(0);
+
+/// 获取串口锁后执行 `f`（整段消息期间独占 `console_putchar`）。
+#[cfg(target_arch = "riscv64")]
+fn with_console_lock(mut f: impl FnMut()) {
+    while CONSOLE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    f();
+    CONSOLE_LOCK.store(false, Ordering::Release);
+}
 
 /// S 态程序入口点。
 ///
@@ -37,35 +65,89 @@ use tg_sbi::{console_putchar, shutdown};
 /// 它完成两件事：
 /// 1. 设置栈指针 `sp`，指向栈顶（栈从高地址向低地址增长）
 /// 2. 跳转到 Rust 主函数 `rust_main`
+/// 多核启动时 S 态每核引导栈数量（与 `m_entry.asm` 中 M 栈 hart 上限一致）。
+#[cfg(target_arch = "riscv64")]
+const SMP_HART_MAX: usize = 8;
+
 #[cfg(target_arch = "riscv64")]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 unsafe extern "C" fn _start() -> ! {
-    // 栈大小：4 KiB
     const STACK_SIZE: usize = 4096;
 
-    // 在 .bss.uninit 段中分配栈空间
     #[unsafe(link_section = ".bss.uninit")]
-    static mut STACK: [u8; STACK_SIZE] = [0u8; STACK_SIZE];
+    static mut STACKS: [[u8; STACK_SIZE]; SMP_HART_MAX] = [[0u8; STACK_SIZE]; SMP_HART_MAX];
 
     core::arch::naked_asm!(
-        "la sp, {stack} + {stack_size}", // 将 sp 设置为栈顶地址
-        "j  {main}",                      // 跳转到 rust_main
+        // a0 = mhartid（由 tg-sbi m_entry 在 mret 前传入）
+        "li     t1, {max_harts}",
+        "bgeu   a0, t1, 9f",
+        "la     t2, {stacks}",
+        "slli   t3, a0, 12",
+        "add    t2, t2, t3",
+        "li     t1, {stack_size}",
+        "add    sp, t2, t1",
+        "j      {main}",
+        "9:",
+        "1:",
+        "j      1b",
+        max_harts = const SMP_HART_MAX,
         stack_size = const STACK_SIZE,
-        stack      =   sym STACK,
-        main       =   sym rust_main,
+        stacks = sym STACKS,
+        main = sym rust_main,
     )
 }
 
-/// S 态主函数：打印 "Hello, world!" 并关机。
-///
-/// 通过 SBI 的 `console_putchar` 逐字节输出字符串，
-/// 然后调用 `shutdown` 正常关机退出 QEMU。
-extern "C" fn rust_main() -> ! {
-    for c in b"Hello, world!\n" {
-        console_putchar(*c);
+/// 无堆十进制输出（供副核打印 `hartid`）。
+#[cfg(target_arch = "riscv64")]
+fn put_decimal(mut n: usize) {
+    if n == 0 {
+        console_putchar(b'0');
+        return;
     }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        i += 1;
+        n /= 10;
+    }
+    while i > 0 {
+        i -= 1;
+        console_putchar(tmp[i]);
+    }
+}
+
+/// S 态主函数：打印 "Hello, world!" 并关机；副核仅打印上线信息后 `wfi` 等待（实验 9：ch1 多核）。
+///
+/// `hartid` 由 M 态 `mret` 经 `a0` 传入（见 `tg-sbi` `m_entry.asm`）。
+#[cfg(target_arch = "riscv64")]
+extern "C" fn rust_main(hartid: usize) -> ! {
+    if hartid != 0 {
+        with_console_lock(|| {
+            for c in b"[ch1] hart " {
+                console_putchar(*c);
+            }
+            put_decimal(hartid);
+            for c in b" secondary online\n" {
+                console_putchar(*c);
+            }
+        });
+        SECONDARIES_PRINTED.fetch_add(1, Ordering::Release);
+        loop {
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        }
+    }
+    let need_secondaries = QEMU_SMP.saturating_sub(1);
+    while SECONDARIES_PRINTED.load(Ordering::Acquire) < need_secondaries {
+        core::hint::spin_loop();
+    }
+    with_console_lock(|| {
+        for c in b"Hello, world!\n" {
+            console_putchar(*c);
+        }
+    });
     shutdown(false) // false 表示正常关机
 }
 

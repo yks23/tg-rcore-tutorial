@@ -17,6 +17,8 @@ struct Cases {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=RCORE_SMP");
+    write_qemu_smp();
     println!("cargo:rerun-if-env-changed=LOG");
     println!("cargo:rerun-if-env-changed=TG_USER_DIR");
     println!("cargo:rerun-if-env-changed=TG_USER_CRATE");
@@ -267,4 +269,18 @@ fn ensure_workspace_table(dir: &PathBuf) {
         fs::write(&cargo_toml, format!("{}\n[workspace]\n", content))
             .unwrap_or_else(|err| panic!("failed to patch Cargo.toml in {}: {}", dir.display(), err));
     }
+}
+
+/// 与 `scripts/qemu-virt-kernel.sh` 的 `RCORE_SMP` 对齐，供内核等待副核条数使用。
+fn write_qemu_smp() {
+    let n = env::var("RCORE_SMP").unwrap_or_else(|_| "8".to_string());
+    let n: usize = n.parse().unwrap_or(8).clamp(1, 8);
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("qemu_smp.rs");
+    fs::write(
+        &out,
+        format!(
+            "/// QEMU `-smp` 核数（构建时 `RCORE_SMP`）。\npub const QEMU_SMP: usize = {n};\n"
+        ),
+    )
+    .unwrap();
 }

@@ -42,6 +42,10 @@ use tg_kernel_context::LocalContext;
 use tg_sbi;
 // 系统调用相关：调用者信息、系统调用 ID
 use tg_syscall::{Caller, SyscallId};
+#[cfg(target_arch = "riscv64")]
+include!(concat!(env!("OUT_DIR"), "/qemu_smp.rs"));
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ========== 启动相关 ==========
 
@@ -50,7 +54,11 @@ use tg_syscall::{Caller, SyscallId};
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(include_str!(env!("APP_ASM")));
 
-// 定义内核入口点：设置 8 页（32 KiB）的内核栈，然后跳转到 rust_main。
+/// 多核 S 态引导栈槽数量（与 `tg-sbi` M 态一致）。
+#[cfg(target_arch = "riscv64")]
+const SMP_HART_MAX: usize = 8;
+
+// 定义内核入口点：每核 8 页（32 KiB）引导栈，然后跳转到 rust_main（实验 9：ch2 多核）。
 //
 // 这里不再调用 tg_linker::boot0! 宏，避免外部已发布版本与 Rust 2024
 // 在属性语义上的兼容差异影响本 crate 的发布校验。
@@ -61,23 +69,108 @@ core::arch::global_asm!(include_str!(env!("APP_ASM")));
 unsafe extern "C" fn _start() -> ! {
     const STACK_SIZE: usize = 8 * 4096;
     #[unsafe(link_section = ".boot.stack")]
-    static mut STACK: [u8; STACK_SIZE] = [0u8; STACK_SIZE];
+    static mut STACKS: [[u8; STACK_SIZE]; SMP_HART_MAX] = [[0u8; STACK_SIZE]; SMP_HART_MAX];
 
     core::arch::naked_asm!(
-        "la sp, {stack} + {stack_size}",
-        "j  {main}",
-        stack = sym STACK,
+        "li     t1, {max_harts}",
+        "bgeu   a0, t1, 9f",
+        "la     t2, {stacks}",
+        "slli   t3, a0, 15",
+        "add    t2, t2, t3",
+        "li     t1, {stack_size}",
+        "add    sp, t2, t1",
+        "j      {main}",
+        "9:",
+        "1:",
+        "j      1b",
+        max_harts = const SMP_HART_MAX,
         stack_size = const STACK_SIZE,
+        stacks = sym STACKS,
         main = sym rust_main,
     )
 }
 
+/// hart 0 完成 `zero_bss` 后置 `true`；副核在此之前不得访问本文件中的 BSS 同步变量（实验 9）。
+#[cfg(target_arch = "riscv64")]
+static BSS_READY: AtomicBool = AtomicBool::new(false);
+
+/// 串行化 `console_putchar`，避免多核下 UART 字节交错（与 ch1 同理）。
+#[cfg(target_arch = "riscv64")]
+static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// 已打印「副核上线」一行的从核个数；hart 0 在 `init_console` 前等待到 `QEMU_SMP - 1`（单核时为 0，不等待）。
+#[cfg(target_arch = "riscv64")]
+static SECONDARIES_ONLINE: AtomicUsize = AtomicUsize::new(0);
+
 // ========== 内核主函数 ==========
 
+/// 获取串口锁后执行 `f`。
+#[cfg(target_arch = "riscv64")]
+fn with_console_lock(mut f: impl FnMut()) {
+    while CONSOLE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    f();
+    CONSOLE_LOCK.store(false, Ordering::Release);
+}
+
+/// 无堆十进制输出（副核在未 `init_console` 前打印 `hartid`）。
+#[cfg(target_arch = "riscv64")]
+fn put_decimal_hart(mut n: usize) {
+    use tg_sbi::console_putchar;
+    if n == 0 {
+        console_putchar(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        i += 1;
+        n /= 10;
+    }
+    while i > 0 {
+        i -= 1;
+        console_putchar(tmp[i]);
+    }
+}
+
 /// 内核主函数：初始化各子系统，然后以批处理方式依次运行所有用户程序。
-extern "C" fn rust_main() -> ! {
+///
+/// `hartid` 由 `tg-sbi` M 态经 `a0` 传入；副核不参与批处理（实验 9）。
+#[cfg(target_arch = "riscv64")]
+extern "C" fn rust_main(hartid: usize) -> ! {
+    if hartid != 0 {
+        while !BSS_READY.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        use tg_sbi::console_putchar;
+        with_console_lock(|| {
+            for c in b"[ch2] hart " {
+                console_putchar(*c);
+            }
+            put_decimal_hart(hartid);
+            for c in b" secondary (batch on hart 0 only)\n" {
+                console_putchar(*c);
+            }
+        });
+        SECONDARIES_ONLINE.fetch_add(1, Ordering::Release);
+        loop {
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        }
+    }
+
     // 第一步：清零 BSS 段（未初始化的全局变量区域）
     unsafe { tg_linker::KernelLayout::locate().zero_bss() };
+    BSS_READY.store(true, Ordering::Release);
+
+    let need_secondaries = QEMU_SMP.saturating_sub(1);
+    while SECONDARIES_ONLINE.load(Ordering::Acquire) < need_secondaries {
+        core::hint::spin_loop();
+    }
 
     // 第二步：初始化控制台输出（使 print!/println! 可用）
     tg_console::init_console(&Console);
