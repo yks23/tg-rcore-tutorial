@@ -1,12 +1,13 @@
 [package]
-name = "tg-rcore-tutorial-ch1"
-description = "Chapter 1 of rCore Tutorial: A minimal bare-metal application running in RISC-V S-mode."
-version = "0.4.8"
+name = "tg-rcore-tutorial-ch1-yks23"
+description = "rCore Tutorial ch1 (minimal S-mode bare-metal), fork suffix yks23 for crates.io."
+# 与 ch3+ 一致：用 preview.N 标记第 N 次提交/发版；下次改为 preview.2、preview.3 …
+version = "0.4.8-preview.1"
 edition = "2024"
 authors = ["YdrMaster <ydrml@hotmail.com>","Yifan Wang<w-yf22@mails.tsinghua.edu.cn>","Yu Chen <yuchen@tsinghua.edu.cn>"]
-repository = "https://github.com/rcore-os/tg-rcore-tutorial-ch1"
-homepage = "https://github.com/rcore-os/tg-rcore-tutorial-ch1/tree/test"
-documentation = "https://docs.rs/tg-rcore-tutorial-ch1"
+repository = "https://github.com/yks23/tg-rcore-tutorial"
+homepage = "https://github.com/yks23/tg-rcore-tutorial/tree/test/tg-rcore-tutorial-ch1"
+documentation = "https://docs.rs/tg-rcore-tutorial-ch1-yks23"
 license = "GPL-3.0"
 readme = "README.md"
 keywords = ["rcore", "tutorial", "no-std", "riscv", "bare-metal"]

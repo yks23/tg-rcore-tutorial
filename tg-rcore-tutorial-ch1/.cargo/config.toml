@@ -3,14 +3,11 @@
 [build]
 target = "riscv64gc-unknown-none-elf"
 
-# QEMU 运行器配置
-# cargo run 时自动调用此命令执行编译产物
-# 等价于：qemu-system-riscv64 -machine virt -nographic -bios none -kernel <编译产物>
+# QEMU 运行器（实验 9/10：核数由环境变量 RCORE_SMP 控制，默认 8）
+# 单核对照：RCORE_SMP=1 cargo run --release
+# 请在各章目录下执行 cargo run，以便 ../scripts 路径正确。
 [target.riscv64gc-unknown-none-elf]
 runner = [
-    "qemu-system-riscv64",
-    "-machine", "virt",       # 使用 QEMU virt 虚拟平台
-    "-nographic",             # 无图形界面，输出重定向到终端
-    "-bios", "none",          # 不加载外部 BIOS/SBI 固件（tg-sbi 内建）
-    "-kernel",                # 后接 ELF 可执行文件路径（由 cargo 自动填充）
+    "bash",
+    "../scripts/qemu-virt-kernel.sh",
 ]
