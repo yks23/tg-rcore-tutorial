@@ -1,12 +1,12 @@
 [package]
-name = "tg-rcore-tutorial-ch5-yks23"
-description = "rCore Tutorial ch5 (fork/exec/wait), fork suffix yks23 for crates.io."
+name = "tg-rcore-tutorial-ch5-yks23-t2l10"
+description = "rCore Tutorial ch5 (fork/exec/wait), fork suffix yks23, T2L10 SMP."
 version = "0.4.8-preview.1"
 edition = "2024"
 authors = ["YdrMaster <ydrml@hotmail.com>","Yifan Wang<w-yf22@mails.tsinghua.edu.cn>","Yu Chen <yuchen@tsinghua.edu.cn>"]
 repository = "https://github.com/yks23/tg-rcore-tutorial"
 homepage = "https://github.com/yks23/tg-rcore-tutorial/tree/test/tg-rcore-tutorial-ch5"
-documentation = "https://docs.rs/tg-rcore-tutorial-ch5-yks23"
+documentation = "https://docs.rs/tg-rcore-tutorial-ch5-yks23-t2l10"
 license = "GPL-3.0"
 readme = "README.md"
 keywords = ["ai", "ai4ose", "kernel", "learning", "os"]

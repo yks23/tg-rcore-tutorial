@@ -12,6 +12,8 @@
 
 > **前置知识**：建议先完成第一章（tg-rcore-tutorial-ch1）和第二章（tg-rcore-tutorial-ch2）的学习，理解裸机启动、Trap 处理、系统调用等基础概念。
 
+> **实验 10（多核）**：设计与验收见 **[SMP-T2L10.md](./SMP-T2L10.md)**；在本目录运行 **`./verify.sh`**（对比 `RCORE_SMP=8` / `1`）。
+
 ## 练习任务（以教代学，学以致用）：
 
 - 学：读本文件，了解相关OS知识，在某个开发环境（在线或本地）中正确编译运行rcore-tutorial-ch3；根据本章的`exercise.md`完成作业练习。
@@ -33,6 +35,8 @@ ch3/
 ├── README.md           # 本文档
 ├── rust-toolchain.toml # Rust 工具链配置
 ├── test.sh             # 自动测试脚本
+├── verify.sh           # 实验 10：多核 / 单核对照交互验收
+├── SMP-T2L10.md        # 实验 10 设计与运行说明
 └── src/
     ├── main.rs         # 内核源码：多道程序主循环、Trap 处理、系统调用
     └── task.rs         # 任务控制块（TCB）和调度事件定义

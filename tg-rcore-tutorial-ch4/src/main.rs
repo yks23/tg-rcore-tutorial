@@ -63,6 +63,10 @@ use tg_kernel_vm::{
 use tg_sbi;
 use tg_syscall::Caller;
 use xmas_elf::ElfFile;
+#[cfg(target_arch = "riscv64")]
+include!(concat!(env!("OUT_DIR"), "/qemu_smp.rs"));
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ========== 辅助函数 ==========
 
@@ -90,6 +94,24 @@ use stub::{build_flags, parse_flags};
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(include_str!(env!("APP_ASM")));
 
+/// hart 0 完成 `zero_bss` 后置位；副核在此之前不得访问 BSS 内同步变量（实验 10）。
+#[cfg(target_arch = "riscv64")]
+static BSS_READY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "riscv64")]
+static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "riscv64")]
+static SECONDARIES_ONLINE: AtomicUsize = AtomicUsize::new(0);
+
+/// hart 0 即将进入调度线程前置位（实验 10）。
+#[cfg(target_arch = "riscv64")]
+static BOOT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// 多核引导栈槽数量（与 `tg-sbi` M 态一致）。
+#[cfg(target_arch = "riscv64")]
+const SMP_HART_MAX: usize = 8;
+
 // 定义内核入口点：分配 24 KiB 内核栈。
 //
 // 这里不再调用 tg_linker::boot0! 宏，避免外部已发布版本与 Rust 2024
@@ -101,15 +123,60 @@ core::arch::global_asm!(include_str!(env!("APP_ASM")));
 unsafe extern "C" fn _start() -> ! {
     const STACK_SIZE: usize = 6 * 4096;
     #[unsafe(link_section = ".boot.stack")]
-    static mut STACK: [u8; STACK_SIZE] = [0u8; STACK_SIZE];
+    static mut STACKS: [[u8; STACK_SIZE]; SMP_HART_MAX] =
+        [[0u8; STACK_SIZE]; SMP_HART_MAX];
 
     core::arch::naked_asm!(
-        "la sp, {stack} + {stack_size}",
-        "j  {main}",
-        stack = sym STACK,
+        "li     t1, {max_harts}",
+        "bgeu   a0, t1, 9f",
+        "la     t2, {stacks}",
+        "slli   t3, a0, 14",
+        "slli   t4, a0, 13",
+        "add    t3, t3, t4",
+        "add    t2, t2, t3",
+        "li     t1, {stack_size}",
+        "add    sp, t2, t1",
+        "j      {main}",
+        "9:",
+        "1:",
+        "j      1b",
+        max_harts = const SMP_HART_MAX,
         stack_size = const STACK_SIZE,
+        stacks = sym STACKS,
         main = sym rust_main,
     )
+}
+
+#[cfg(target_arch = "riscv64")]
+fn with_console_lock(mut f: impl FnMut()) {
+    while CONSOLE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    f();
+    CONSOLE_LOCK.store(false, Ordering::Release);
+}
+
+#[cfg(target_arch = "riscv64")]
+fn put_decimal_hart(mut n: usize) {
+    use tg_sbi::console_putchar;
+    if n == 0 {
+        console_putchar(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        i += 1;
+        n /= 10;
+    }
+    while i > 0 {
+        i -= 1;
+        console_putchar(tmp[i]);
+    }
 }
 
 // 物理内存容量 = 24 MiB（QEMU virt 平台的 RAM 大小）
@@ -150,10 +217,40 @@ static PROCESSES: ProcessList = ProcessList::new();
 /// 3. 建立内核地址空间（Sv39 页表）
 /// 4. 为每个用户程序解析 ELF 并创建独立地址空间
 /// 5. 建立调度线程执行用户进程
-extern "C" fn rust_main() -> ! {
+///
+/// `hartid` 由 `tg-sbi` 经 `a0` 传入；仅 hart 0 跑调度线程；副核经 `BSS_READY` 后打印上线行再 `wfi`（实验 10）。
+#[cfg(target_arch = "riscv64")]
+extern "C" fn rust_main(hartid: usize) -> ! {
+    if hartid != 0 {
+        while !BSS_READY.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        use tg_sbi::console_putchar;
+        with_console_lock(|| {
+            for c in b"[ch4] hart " {
+                console_putchar(*c);
+            }
+            put_decimal_hart(hartid);
+            for c in b" secondary (scheduler on hart 0 only)\n" {
+                console_putchar(*c);
+            }
+        });
+        SECONDARIES_ONLINE.fetch_add(1, Ordering::Release);
+        loop {
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        }
+    }
+
     let layout = tg_linker::KernelLayout::locate();
     // 第一步：清零 BSS 段
     unsafe { layout.zero_bss() };
+    BSS_READY.store(true, Ordering::Release);
+
+    let need_secondaries = QEMU_SMP.saturating_sub(1);
+    while SECONDARIES_ONLINE.load(Ordering::Acquire) < need_secondaries {
+        core::hint::spin_loop();
+    }
+
     // 第二步：初始化控制台
     tg_console::init_console(&Console);
     tg_console::set_log_level(option_env!("LOG"));
@@ -204,6 +301,7 @@ extern "C" fn rust_main() -> ! {
     // 调度线程在独立的异常域运行，内核异常不会导致整个系统崩溃
     let mut scheduling = LocalContext::thread(schedule as *const () as _, false);
     *scheduling.sp_mut() = 1 << 38;
+    BOOT_DONE.store(true, Ordering::Release);
     unsafe { scheduling.execute() };
     // 如果从 execute() 返回，说明调度线程发生了异常
     log::error!("stval = {:#x}", stval::read());

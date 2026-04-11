@@ -43,6 +43,10 @@ use task::TaskControlBlock;
 use tg_console::log;
 // SBI 调用：set_timer、console_putchar、shutdown 等
 use tg_sbi;
+#[cfg(target_arch = "riscv64")]
+include!(concat!(env!("OUT_DIR"), "/qemu_smp.rs"));
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ========== 启动相关 ==========
 
@@ -58,6 +62,26 @@ const APP_CAPACITY: usize = 32;
 /// `32 × (用户栈 8KiB + syscall 计数表等)` 导致栈溢出。
 static mut KERNEL_TCBS: [TaskControlBlock; APP_CAPACITY] = [TaskControlBlock::ZERO; APP_CAPACITY];
 
+/// hart 0 完成 `zero_bss` 后置位；副核在此之前不得访问本文件 BSS 内同步变量（实验 10）。
+#[cfg(target_arch = "riscv64")]
+static BSS_READY: AtomicBool = AtomicBool::new(false);
+
+/// 串行化 `console_putchar`，避免多核 UART 字节交错。
+#[cfg(target_arch = "riscv64")]
+static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// 已打印「副核上线」的从核个数；hart 0 在 `init_console` 前等到 `QEMU_SMP - 1`（单核为 0）。
+#[cfg(target_arch = "riscv64")]
+static SECONDARIES_ONLINE: AtomicUsize = AtomicUsize::new(0);
+
+/// hart 0 完成全局初始化与时钟中断开启后置位；供需要「全系统就绪」语义时使用（实验 10）。
+#[cfg(target_arch = "riscv64")]
+static BOOT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// 多核引导栈槽数量（与 `tg-sbi` M 态一致）。
+#[cfg(target_arch = "riscv64")]
+const SMP_HART_MAX: usize = 8;
+
 // 定义内核入口点：分配 (APP_CAPACITY + 2) * 8 KiB = 272 KiB 的内核栈
 // 比第二章更大，因为需要同时容纳多个任务的内核上下文。
 //
@@ -70,15 +94,62 @@ static mut KERNEL_TCBS: [TaskControlBlock; APP_CAPACITY] = [TaskControlBlock::ZE
 unsafe extern "C" fn _start() -> ! {
     const STACK_SIZE: usize = (APP_CAPACITY + 2) * 8192;
     #[unsafe(link_section = ".boot.stack")]
-    static mut STACK: [u8; STACK_SIZE] = [0u8; STACK_SIZE];
+    static mut STACKS: [[u8; STACK_SIZE]; SMP_HART_MAX] =
+        [[0u8; STACK_SIZE]; SMP_HART_MAX];
 
     core::arch::naked_asm!(
-        "la sp, {stack} + {stack_size}",
-        "j  {main}",
-        stack = sym STACK,
+        "li     t1, {max_harts}",
+        "bgeu   a0, t1, 9f",
+        "la     t2, {stacks}",
+        "slli   t3, a0, 13",
+        "slli   t4, t3, 5",
+        "slli   t5, t3, 1",
+        "add    t3, t4, t5",
+        "add    t2, t2, t3",
+        "li     t1, {stack_size}",
+        "add    sp, t2, t1",
+        "j      {main}",
+        "9:",
+        "1:",
+        "j      1b",
+        max_harts = const SMP_HART_MAX,
         stack_size = const STACK_SIZE,
+        stacks = sym STACKS,
         main = sym rust_main,
     )
+}
+
+#[cfg(target_arch = "riscv64")]
+fn with_console_lock(mut f: impl FnMut()) {
+    while CONSOLE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    f();
+    CONSOLE_LOCK.store(false, Ordering::Release);
+}
+
+/// 无堆十进制输出（副核在 `init_console` 前打印 hartid）。
+#[cfg(target_arch = "riscv64")]
+fn put_decimal_hart(mut n: usize) {
+    use tg_sbi::console_putchar;
+    if n == 0 {
+        console_putchar(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        i += 1;
+        n /= 10;
+    }
+    while i > 0 {
+        i -= 1;
+        console_putchar(tmp[i]);
+    }
 }
 
 // ========== 内核主函数 ==========
@@ -89,9 +160,38 @@ unsafe extern "C" fn _start() -> ! {
 /// - 多个任务同时驻留在内存中，每个任务拥有独立的 TCB 和用户栈
 /// - 任务之间通过时间片轮转切换（抢占式调度，默认模式）
 /// - 任务可以主动让出 CPU（协作式调度，通过 yield，需启用 `coop` feature）
-extern "C" fn rust_main() -> ! {
+///
+/// `hartid` 由 `tg-sbi` 经 `a0` 传入；调度与时钟中断仅在 hart 0 启用；副核经 `BSS_READY` 后打印上线行再 `wfi`（实验 10）。
+#[cfg(target_arch = "riscv64")]
+extern "C" fn rust_main(hartid: usize) -> ! {
+    if hartid != 0 {
+        while !BSS_READY.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        use tg_sbi::console_putchar;
+        with_console_lock(|| {
+            for c in b"[ch3] hart " {
+                console_putchar(*c);
+            }
+            put_decimal_hart(hartid);
+            for c in b" secondary (scheduler on hart 0 only)\n" {
+                console_putchar(*c);
+            }
+        });
+        SECONDARIES_ONLINE.fetch_add(1, Ordering::Release);
+        loop {
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        }
+    }
+
     // 第一步：清零 BSS 段（未初始化的全局变量区域）
     unsafe { tg_linker::KernelLayout::locate().zero_bss() };
+    BSS_READY.store(true, Ordering::Release);
+
+    let need_secondaries = QEMU_SMP.saturating_sub(1);
+    while SECONDARIES_ONLINE.load(Ordering::Acquire) < need_secondaries {
+        core::hint::spin_loop();
+    }
 
     // 第二步：初始化控制台输出（使 print!/println! 可用）
     // 默认日志级别为 info（可通过 LOG 环境变量覆盖）
@@ -117,6 +217,9 @@ extern "C" fn rust_main() -> ! {
         index_mod += 1;
     }
     println!();
+
+    // 副核可安全使用已初始化的全局状态与控制台
+    BOOT_DONE.store(true, Ordering::Release);
 
     // 第五步：开启 S 特权级时钟中断
     // 这是实现抢占式调度的关键：允许时钟中断打断用户程序的执行

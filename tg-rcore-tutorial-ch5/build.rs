@@ -11,6 +11,8 @@ struct Cases {
 }
 
 fn main() {
+    write_qemu_smp();
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LOG");
     println!("cargo:rerun-if-env-changed=TG_USER_DIR");
@@ -31,6 +33,21 @@ fn main() {
             build_apps();
         }
     }
+}
+
+/// 写入 `OUT_DIR/qemu_smp.rs`，供 `main.rs` `include!`；与 `scripts/qemu-virt-kernel.sh` 的 `RCORE_SMP` 一致（实验 10）。
+fn write_qemu_smp() {
+    println!("cargo:rerun-if-env-changed=RCORE_SMP");
+    let n = env::var("RCORE_SMP").unwrap_or_else(|_| "8".to_string());
+    let n: usize = n.parse().unwrap_or(8).clamp(1, 8);
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("qemu_smp.rs");
+    fs::write(
+        &out,
+        format!(
+            "/// QEMU `-smp` 核数（构建时 `RCORE_SMP`，默认 8）。\npub const QEMU_SMP: usize = {n};\n"
+        ),
+    )
+    .unwrap();
 }
 
 fn should_skip_build_apps() -> bool {
