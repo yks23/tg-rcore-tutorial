@@ -1,7 +1,7 @@
 [package]
 name = "tg-rcore-tutorial-ch3-yks23-t2l10"
 description = "rCore Tutorial ch3 (multiprogramming / preemptive scheduling), fork suffix yks23, T2L10 SMP."
-version = "0.4.8-preview.1"
+version = "0.4.8-preview.2"
 edition = "2024"
 authors = ["YdrMaster <ydrml@hotmail.com>","Yifan Wang<w-yf22@mails.tsinghua.edu.cn>","Yu Chen <yuchen@tsinghua.edu.cn>"]
 repository = "https://github.com/yks23/tg-rcore-tutorial"
