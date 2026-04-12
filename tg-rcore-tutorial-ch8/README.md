@@ -1,4 +1,38 @@
-# 第八章：并发
+# 第八章：并发（T3L8: ch8-doom VirtIO-GPU Raycasting 3D 演示）
+
+[![crates.io](https://img.shields.io/crates/v/tg-rcore-tutorial-ch8-yks23-doom.svg)](https://crates.io/crates/tg-rcore-tutorial-ch8-yks23-doom)
+
+## T3L8 实验说明
+
+**AI4OSE Lab1 T3L8**：在 ch8 线程/同步原语基础上，扩展内核支持 VirtIO-GPU，实现用户态 Doom 风格 Raycasting 3D 渲染演示。
+
+**crate 名称**：`tg-rcore-tutorial-ch8-yks23-doom`
+
+**运行方式**：
+```bash
+# 方式一：通过 cargo clone
+cargo install cargo-clone
+cargo clone tg-rcore-tutorial-ch8-yks23-doom
+cd tg-rcore-tutorial-ch8-yks23-doom
+bash show.sh demo      # CHAPTER=game 自动截图模式
+bash show.sh vnc       # VNC:5901 模式（SSH -L 5901:127.0.0.1:5901）
+bash show.sh gui       # 本地图形窗口（需 DISPLAY）
+
+# 方式二：通过 git clone
+git clone https://github.com/yks23/tg-rcore-tutorial.git
+cd tg-rcore-tutorial/tg-rcore-tutorial-ch8
+bash show.sh demo
+```
+
+**实现特性**：
+- 内核 VirtIO-GPU 驱动（`src/virtio_gpu.rs`），syscall 622/623，与 ch6 一致
+- 用户态 `doom.rs`：Wolf3D 风格 Raycasting 引擎
+  - 纯整数 sin/cos 查找表（512 步，16.16 定点数）
+  - DDA 光线投射，雾效（距离暗化），透视校正
+  - 自动巡逻 AI 玩家，小地图叠加显示
+  - 静态 1280×800 BGRA 帧缓冲（避免用户堆大块分配）
+
+
 
 本章在第七章"进程间通信与信号"的基础上，引入了两大核心机制：
 

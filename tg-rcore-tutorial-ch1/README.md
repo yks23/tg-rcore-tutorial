@@ -1,4 +1,38 @@
-# 第一章：应用程序与基本执行环境
+# 第一章：应用程序与基本执行环境（T3L1: ch1-tangram VirtIO-GPU 七巧板图案）
+
+[![crates.io](https://img.shields.io/crates/v/tg-rcore-tutorial-ch1-yks23-tangram.svg)](https://crates.io/crates/tg-rcore-tutorial-ch1-yks23-tangram)
+
+## T3L1 实验说明
+
+**AI4OSE Lab1 T3L1**：在 ch1 基础上，通过 VirtIO-GPU framebuffer 绘制七巧板 "OS" 图案。
+
+**crate 名称**：`tg-rcore-tutorial-ch1-yks23-tangram`
+
+**运行方式**：
+```bash
+# 方式一：通过 cargo clone
+cargo install cargo-clone
+cargo clone tg-rcore-tutorial-ch1-yks23-tangram
+cd tg-rcore-tutorial-ch1-yks23-tangram
+RCORE_SMP=1 cargo build
+bash show.sh default  # 无头截图模式（自动截图 screenshot-tangram.ppm）
+bash show.sh vnc      # VNC:5901 模式（SSH -L 5901:127.0.0.1:5901 转发后连接）
+bash show.sh gui      # 本地图形窗口（需 DISPLAY 环境变量）
+
+# 方式二：通过 git clone
+git clone https://github.com/yks23/tg-rcore-tutorial.git
+cd tg-rcore-tutorial/tg-rcore-tutorial-ch1
+RCORE_SMP=1 cargo build
+bash show.sh default
+```
+
+**实现特性**：
+- 使用 `virtio-drivers` 的 `VirtIOGpu` 实现 VirtIO-GPU 驱动（支持 legacy/modern MMIO transport）
+- 通过静态内存池 HAL 在无堆裸机环境下运行 `virtio-drivers`
+- 自动扫描所有 VirtIO MMIO slot（0x10001000~0x10008000）定位 GPU 设备
+- 绘制 7 色七巧板 "O" + "S" 图案到 1280×800 framebuffer
+
+
 
 本章实现了一个最简单的 RISC-V S 态裸机程序（tg-rcore-tutorial-ch1），展示操作系统的最小执行环境。程序在 QEMU 模拟的 RISC-V 64 硬件上运行，不依赖 OpenSBI 或 RustSBI，通过 `-bios none` 模式直接启动，打印 `Hello, world!` 后关机。
 

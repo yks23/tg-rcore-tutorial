@@ -1,4 +1,37 @@
-# 第六章：文件系统
+# 第六章：文件系统（T3L6: ch6-breakout VirtIO-GPU 打砖块游戏）
+
+[![crates.io](https://img.shields.io/crates/v/tg-rcore-tutorial-ch6-yks23-breakout.svg)](https://crates.io/crates/tg-rcore-tutorial-ch6-yks23-breakout)
+
+## T3L6 实验说明
+
+**AI4OSE Lab1 T3L6**：在 ch6 文件系统基础上，扩展内核支持 VirtIO-GPU，实现用户态打砖块游戏。
+
+**crate 名称**：`tg-rcore-tutorial-ch6-yks23-breakout`
+
+**运行方式**：
+```bash
+# 方式一：通过 cargo clone
+cargo install cargo-clone
+cargo clone tg-rcore-tutorial-ch6-yks23-breakout
+cd tg-rcore-tutorial-ch6-yks23-breakout
+bash show.sh demo      # CHAPTER=game 自动截图模式
+bash show.sh vnc       # VNC:5901 模式（SSH -L 5901:127.0.0.1:5901）
+bash show.sh gui       # 本地图形窗口（需 DISPLAY）
+
+# 方式二：通过 git clone
+git clone https://github.com/yks23/tg-rcore-tutorial.git
+cd tg-rcore-tutorial/tg-rcore-tutorial-ch6
+bash show.sh demo
+```
+
+**实现特性**：
+- 内核新增 VirtIO-GPU 驱动（`src/virtio_gpu.rs`），支持自定义 syscall 622/623
+- 自定义 syscall 622 `draw_framebuffer(ptr, w, h)`：将用户帧缓冲刷新到屏幕
+- 自定义 syscall 623 `get_fb_info(out)`：获取屏幕分辨率
+- 用户态 `breakout.rs`：AI 挡板打砖块游戏（BGRA 静态帧缓冲，DDA 物理，5 色砖块，分数显示）
+- `CHAPTER=game` 编译时选择游戏程序集，`initproc` exec `breakout`
+
+
 
 本章在第五章"进程管理"的基础上，引入了 **文件系统** 支持。用户程序不再嵌入内核镜像，而是存放在 **磁盘镜像**（fs.img）中，内核通过 **VirtIO 块设备驱动** 和 **easy-fs 文件系统** 按名称加载和执行程序。同时，进程拥有了**文件描述符表**，可以通过 `open`/`close`/`read`/`write` 等标准接口操作文件。
 
