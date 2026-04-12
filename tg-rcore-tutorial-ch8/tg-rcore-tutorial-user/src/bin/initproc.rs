@@ -20,6 +20,7 @@ extern "C" fn main() -> i32 {
             "-6" => "ch6b_usertest",
             "-7" => "ch7b_usertest",
             "-8" => "ch8b_usertest",
+            "game" => "doom",
             _ => "user_shell",
         };
         exec(target);

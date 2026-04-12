@@ -334,6 +334,10 @@ path = "src/bin/threads_arg.rs"
 name = "user_shell"
 path = "src/bin/user_shell.rs"
 
+[[bin]]
+name = "doom"
+path = "src/bin/doom.rs"
+
 [dependencies.customizable-buddy]
 version = "0.0.2"
 

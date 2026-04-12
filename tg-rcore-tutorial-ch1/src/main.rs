@@ -1,6 +1,7 @@
-//! # 第一章：应用程序与基本执行环境
+//! # 第一章：应用程序与基本执行环境（扩展：ch1-tangram 七巧板图案）
 //!
 //! 本章实现了一个最简单的 RISC-V S 态裸机程序，展示操作系统的最小执行环境。
+//! 扩展实验（ch1-tangram）：通过 VirtIO-GPU 在 Framebuffer 上绘制七巧板 "OS" 图案。
 //!
 //! ## 关键概念
 //!
@@ -8,12 +9,7 @@
 //! - `#![no_main]`：不使用标准的 `main` 入口，自定义裸函数 `_start` 作为入口
 //! - 裸函数（naked function）：不生成函数序言/尾声，可在无栈环境下执行
 //! - SBI（Supervisor Binary Interface）：S 态软件向 M 态固件请求服务的标准接口
-//!
-//! 教程阅读建议：
-//!
-//! - 先看 `_start`：理解无运行时情况下的最小启动流程；
-//! - 再看 `rust_main`：理解最小 I/O 路径（SBI 输出 + 关机）；
-//! - 最后看 `panic_handler`：理解 no_std 程序的异常收口方式。
+//! - VirtIO-GPU：QEMU 提供的虚拟 GPU 设备，通过 MMIO 和 virtqueue 通信
 
 // 不使用标准库，因为裸机环境没有操作系统提供系统调用支持
 #![no_std]
@@ -119,7 +115,7 @@ fn put_decimal(mut n: usize) {
     }
 }
 
-/// S 态主函数：打印 "Hello, world!" 并关机；副核仅打印上线信息后 `wfi` 等待（实验 9：ch1 多核）。
+/// S 态主函数：绘制七巧板 "OS" 图案并关机；副核仅打印上线信息后 `wfi` 等待（实验 9：ch1 多核）。
 ///
 /// `hartid` 由 M 态 `mret` 经 `a0` 传入（见 `tg-sbi` `m_entry.asm`）。
 #[cfg(target_arch = "riscv64")]
@@ -143,12 +139,36 @@ extern "C" fn rust_main(hartid: usize) -> ! {
     while SECONDARIES_PRINTED.load(Ordering::Acquire) < need_secondaries {
         core::hint::spin_loop();
     }
+
     with_console_lock(|| {
-        for c in b"Hello, world!\n" {
+        for c in b"[ch1-tangram] VirtIO-GPU framebuffer demo\n" {
             console_putchar(*c);
         }
     });
-    shutdown(false) // false 表示正常关机
+
+    // 尝试初始化 VirtIO-GPU 并绘制七巧板
+    match virtio_gpu::init_and_draw() {
+        Ok(()) => {
+            with_console_lock(|| {
+                for c in b"[ch1-tangram] OK: tangram drawn to framebuffer\n" {
+                    console_putchar(*c);
+                }
+            });
+        }
+        Err(e) => {
+            with_console_lock(|| {
+                for c in b"[ch1-tangram] GPU error: " {
+                    console_putchar(*c);
+                }
+                for c in e.as_bytes() {
+                    console_putchar(*c);
+                }
+                console_putchar(b'\n');
+            });
+        }
+    }
+
+    shutdown(false)
 }
 
 /// panic 处理函数。
@@ -180,4 +200,264 @@ mod stub {
     /// Rust 异常处理人格占位
     #[unsafe(no_mangle)]
     pub extern "C" fn rust_eh_personality() {}
+}
+
+/// VirtIO-GPU 裸机驱动模块。
+///
+/// 使用 `virtio-drivers` crate 提供的 `VirtIOGpu` 驱动。
+/// 通过一个静态内存池实现 `Hal` trait（零堆分配），
+/// 在裸机 S 态（无操作系统、无分页）下操作 QEMU virt 平台的 VirtIO-GPU。
+///
+/// QEMU virt 平台（无分页时）虚拟地址 == 物理地址，DMA 地址直接用虚拟地址即可。
+#[cfg(target_arch = "riscv64")]
+mod virtio_gpu {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use virtio_drivers::{Hal, MmioTransport, PhysAddr, VirtAddr, VirtIOGpu, VirtIOHeader};
+
+    // ────────────────────────────────────────────────────────────────
+    // 全局堆分配器（bump allocator，供 virtio-drivers 的 alloc 使用）
+    // virtio-drivers 在内部使用 alloc::vec 等，因此需要全局分配器。
+    // ────────────────────────────────────────────────────────────────
+    const HEAP_SIZE: usize = 0x80_0000; // 8 MiB
+
+    #[repr(C, align(4096))]
+    struct HeapSpace([u8; HEAP_SIZE]);
+    static mut HEAP_SPACE: HeapSpace = HeapSpace([0u8; HEAP_SIZE]);
+    static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    struct BumpAlloc;
+
+    unsafe impl core::alloc::GlobalAlloc for BumpAlloc {
+        unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+            let align = layout.align();
+            let size = layout.size();
+            let base = (&raw mut HEAP_SPACE) as usize;
+            loop {
+                let cur = HEAP_NEXT.load(Ordering::Relaxed);
+                let aligned = (base + cur + align - 1) & !(align - 1);
+                let end = aligned - base + size;
+                if end > HEAP_SIZE {
+                    return core::ptr::null_mut();
+                }
+                if HEAP_NEXT.compare_exchange(cur, end, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    return aligned as *mut u8;
+                }
+            }
+        }
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
+            // bump allocator，不释放
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: BumpAlloc = BumpAlloc;
+
+    // ────────────────────────────────────────────────────────────────
+    // 静态 DMA 内存池（供 virtio-drivers Hal 使用）
+    // ────────────────────────────────────────────────────────────────
+    const PAGE_SIZE: usize = 0x1000;
+    const POOL_PAGES: usize = 1600; // 6.25 MiB for DMA (covers 1280x800x4 + overhead)
+
+    #[repr(C, align(4096))]
+    struct DmaPool([u8; PAGE_SIZE * POOL_PAGES]);
+
+    static mut DMA_POOL: DmaPool = DmaPool([0u8; PAGE_SIZE * POOL_PAGES]);
+    static DMA_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// 静态内存池 HAL 实现（bump allocator，无 free）。
+    pub struct StaticHal;
+
+    impl Hal for StaticHal {
+        fn dma_alloc(pages: usize) -> PhysAddr {
+            let offset = DMA_NEXT.fetch_add(pages, Ordering::Relaxed);
+            if offset + pages > POOL_PAGES {
+                return 0; // OOM
+            }
+            unsafe { ((&raw mut DMA_POOL) as *mut u8).add(offset * PAGE_SIZE) as usize }
+        }
+
+        fn dma_dealloc(_paddr: PhysAddr, _pages: usize) -> i32 {
+            0 // bump allocator 不释放
+        }
+
+        fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
+            paddr // 无分页，物理 == 虚拟
+        }
+
+        fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
+            vaddr // 无分页，物理 == 虚拟
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // VirtIO-GPU 初始化 + 绘制
+    // ────────────────────────────────────────────────────────────────
+
+    /// 扫描 QEMU virt 平台的 VirtIO MMIO slot，返回 GPU 设备的基地址。
+    fn find_gpu() -> Option<usize> {
+        for slot in (0..8usize).rev() {
+            // QEMU 按逆序分配：最高 slot = 0x1000_8000 对应第一个 -device
+            let base = 0x1000_1000 + slot * 0x1000;
+            let magic = unsafe { core::ptr::read_volatile(base as *const u32) };
+            if magic != 0x7472_6976 {
+                continue;
+            }
+            let dev_id = unsafe { core::ptr::read_volatile((base + 0x8) as *const u32) };
+            if dev_id == 16 {
+                // VirtIO GPU device ID
+                return Some(base);
+            }
+        }
+        None
+    }
+
+    /// 初始化 VirtIO-GPU 并绘制七巧板 "OS" 图案。
+    pub fn init_and_draw() -> Result<(), &'static str> {
+        let base = find_gpu().ok_or("no VirtIO-GPU device found")?;
+
+        let header = core::ptr::NonNull::new(base as *mut VirtIOHeader).unwrap();
+        let transport = unsafe {
+            MmioTransport::new(header).map_err(|_| "MmioTransport::new failed")?
+        };
+
+        let mut gpu = VirtIOGpu::<StaticHal, MmioTransport>::new(transport)
+            .map_err(|_| "VirtIOGpu::new failed")?;
+
+        let (w, h) = gpu.resolution().map_err(|_| "resolution failed")?;
+
+        let fb = gpu
+            .setup_framebuffer()
+            .map_err(|_| "setup_framebuffer failed")?;
+
+        draw_tangram(fb, w, h);
+
+        gpu.flush().map_err(|_| "flush failed")?;
+
+        Ok(())
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 七巧板绘制逻辑
+    // ────────────────────────────────────────────────────────────────
+
+    /// 颜色：B8G8R8A8（小端存储：buf[0]=B, buf[1]=G, buf[2]=R, buf[3]=A）
+    const BLACK: [u8; 4] = [0x10, 0x10, 0x10, 0xFF]; // 深色背景
+    const RED: [u8; 4] = [0x30, 0x40, 0xE0, 0xFF];   // 红色
+    const ORANGE: [u8; 4] = [0x00, 0x80, 0xFF, 0xFF]; // 橙色
+    const YELLOW: [u8; 4] = [0x00, 0xCC, 0xFF, 0xFF]; // 黄色
+    const GREEN: [u8; 4] = [0x30, 0xC0, 0x50, 0xFF];  // 绿色
+    const BLUE: [u8; 4] = [0xD0, 0x60, 0x20, 0xFF];   // 蓝色
+    const CYAN: [u8; 4] = [0xCC, 0xAA, 0x20, 0xFF];   // 青色
+    const PURPLE: [u8; 4] = [0xB0, 0x30, 0x90, 0xFF]; // 紫色
+
+    /// 设置像素（BGRA 格式）
+    fn set_pixel(buf: &mut [u8], w: u32, x: u32, y: u32, color: [u8; 4]) {
+        if x >= w {
+            return;
+        }
+        let offset = ((y * w + x) * 4) as usize;
+        if offset + 3 < buf.len() {
+            buf[offset] = color[0];
+            buf[offset + 1] = color[1];
+            buf[offset + 2] = color[2];
+            buf[offset + 3] = color[3];
+        }
+    }
+
+    /// 填充矩形区域
+    fn fill_rect(buf: &mut [u8], w: u32, x0: u32, y0: u32, rw: u32, rh: u32, color: [u8; 4]) {
+        for dy in 0..rh {
+            for dx in 0..rw {
+                set_pixel(buf, w, x0 + dx, y0 + dy, color);
+            }
+        }
+    }
+
+    /// 填充等腰直角三角形（垂直方向）
+    /// `dir`=0：顶角在上（▽形）；`dir`=1：顶角在下（△形）
+    fn fill_triangle_v(
+        buf: &mut [u8],
+        w: u32,
+        x0: u32,
+        y0: u32,
+        size: u32,
+        color: [u8; 4],
+        dir: u8,
+    ) {
+        let cx = x0 + size / 2;
+        for row in 0..size {
+            let (start_x, end_x) = if dir == 0 {
+                let s = cx.saturating_sub(row);
+                (s, cx + row + 1)
+            } else {
+                let inv = size - 1 - row;
+                let s = cx.saturating_sub(inv);
+                (s, cx + inv + 1)
+            };
+            for px in start_x..end_x {
+                set_pixel(buf, w, px, y0 + row, color);
+            }
+        }
+    }
+
+    /// 填充平行四边形（向右倾斜）
+    fn fill_parallelogram(
+        buf: &mut [u8],
+        w: u32,
+        x0: u32,
+        y0: u32,
+        pw: u32,
+        ph: u32,
+        color: [u8; 4],
+    ) {
+        for row in 0..ph {
+            for col in 0..pw {
+                set_pixel(buf, w, x0 + col + row, y0 + row, color);
+            }
+        }
+    }
+
+    /// 绘制七巧板 "OS" 图案。
+    ///
+    /// 图案分两部分：左侧 "O"（正方形七巧板），右侧 "S"（七巧板拼接）。
+    /// 使用标准七巧板的 7 块：大三角 ×2、中三角 ×1、小三角 ×2、正方形 ×1、平行四边形 ×1。
+    fn draw_tangram(buf: &mut [u8], scr_w: u32, scr_h: u32) {
+        // 先填充深色背景
+        for y in 0..scr_h {
+            for x in 0..scr_w {
+                set_pixel(buf, scr_w, x, y, BLACK);
+            }
+        }
+
+        // 七巧板单元格大小
+        let unit = (scr_h.min(scr_w) / 6).max(40);
+        let total_w = unit * 7;
+        let start_x = (scr_w.saturating_sub(total_w)) / 2;
+        let start_y = (scr_h.saturating_sub(unit * 4)) / 2;
+
+        // ────── 字母 "O" ──────
+        let ox = start_x;
+        let oy = start_y;
+        let s = unit;
+
+        fill_triangle_v(buf, scr_w, ox, oy, s, RED, 0);
+        fill_triangle_v(buf, scr_w, ox + s, oy, s, ORANGE, 0);
+        fill_rect(buf, scr_w, ox, oy + s / 2, s / 2, s / 2, YELLOW);
+        fill_parallelogram(buf, scr_w, ox + s / 2, oy + s / 2, s / 2, s / 4, GREEN);
+        fill_triangle_v(buf, scr_w, ox + s / 4, oy + s, s, BLUE, 1);
+        fill_triangle_v(buf, scr_w, ox, oy + s + s / 2, s / 2, CYAN, 1);
+        fill_triangle_v(buf, scr_w, ox + s + s / 4, oy + s + s / 2, s / 2, PURPLE, 1);
+
+        // ────── 字母 "S" ──────
+        let sx = start_x + unit * 4;
+        let sy = start_y;
+
+        fill_triangle_v(buf, scr_w, sx + s / 2, sy, s, ORANGE, 0);
+        fill_triangle_v(buf, scr_w, sx, sy, s / 2, RED, 0);
+        fill_rect(buf, scr_w, sx, sy + s / 2, s, s / 4, CYAN);
+        fill_triangle_v(buf, scr_w, sx, sy + s, s, BLUE, 1);
+        fill_rect(buf, scr_w, sx, sy + s + s / 2, s, s / 4, GREEN);
+        fill_triangle_v(buf, scr_w, sx + s / 2, sy + s + s / 2, s / 2, PURPLE, 1);
+        fill_parallelogram(buf, scr_w, sx, sy + s + s / 2 + s / 4, s, s / 4, YELLOW);
+    }
 }

@@ -44,6 +44,8 @@ mod process;
 mod processor;
 /// VirtIO 块设备驱动模块
 mod virtio_block;
+/// VirtIO GPU 驱动模块（ch6 扩展：图形支持）
+mod virtio_gpu;
 
 #[macro_use]
 extern crate tg_console;
@@ -151,8 +153,12 @@ static KERNEL_SPACE: KernelSpace = KernelSpace::new();
 /// VirtIO MMIO 设备地址范围
 ///
 /// QEMU virt 平台上 VirtIO 块设备的 MMIO 基地址为 0x1000_1000，大小 0x1000。
+/// VirtIO GPU 设备占用 0x1000_8000（第一个 -device virtio-gpu-device 分配到最高 slot）。
 /// 需要在内核地址空间中进行恒等映射，以便驱动程序访问。
-pub const MMIO: &[(usize, usize)] = &[(0x1000_1000, 0x00_1000)];
+pub const MMIO: &[(usize, usize)] = &[
+    (0x1000_1000, 0x00_1000), // VirtIO 块设备
+    (virtio_gpu::GPU_MMIO.0, virtio_gpu::GPU_MMIO.1), // VirtIO GPU
+];
 
 /// 内核主函数——系统初始化和启动入口
 ///
@@ -225,6 +231,57 @@ extern "C" fn rust_main() -> ! {
                         id = ctx.a(7).into();
                         args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
                     }
+                    // ── GPU 自定义 syscall（不在标准表里，单独处理）──
+                    // syscall 622: draw_framebuffer(buf_ptr, w, h) -> isize
+                    // syscall 623: get_fb_info(info_ptr: *mut [u32;2]) -> isize  ([width, height])
+                    const SYSCALL_DRAW_FB: usize = 622;
+                    const SYSCALL_GET_FB_INFO: usize = 623;
+                    let gpu_ret: Option<isize> = if id.0 == SYSCALL_DRAW_FB {
+                        let buf_ptr = args[0];
+                        let w = args[1] as u32;
+                        let h = args[2] as u32;
+                        let current = unsafe { (*processor).current().unwrap() };
+                        const READABLE: VmFlags<Sv39> = build_flags("RV");
+                        if let Some(ptr) = current
+                            .address_space
+                            .translate::<u8>(VAddr::new(buf_ptr), READABLE)
+                        {
+                            let size = (w * h * 4) as usize;
+                            let mut gpu = virtio_gpu::GPU_DEVICE.lock();
+                            let ok = gpu.write_fb_from_user(ptr.as_ptr(), size);
+                            Some(if ok { 0 } else { -1 })
+                        } else {
+                            Some(-1)
+                        }
+                    } else if id.0 == SYSCALL_GET_FB_INFO {
+                        let info_ptr = args[0];
+                        let current = unsafe { (*processor).current().unwrap() };
+                        const WRITABLE: VmFlags<Sv39> = build_flags("W_V");
+                        if let Some(mut ptr) = current
+                            .address_space
+                            .translate::<u32>(VAddr::new(info_ptr), WRITABLE)
+                        {
+                            let gpu = virtio_gpu::GPU_DEVICE.lock();
+                            unsafe {
+                                *ptr.as_mut() = gpu.width;
+                                *ptr.as_ptr().add(1) = gpu.height;
+                            }
+                            Some(0)
+                        } else {
+                            Some(-1)
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(ret) = gpu_ret {
+                        const STRIDE_BIG: usize = 0x1000_0000;
+                        *task.context.context.a_mut(0) = ret as _;
+                        task.stride = task
+                            .stride
+                            .wrapping_add(STRIDE_BIG / task.priority.max(1));
+                        unsafe { (*processor).make_current_suspend() };
+                    } else {
                     match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
                         Ret::Done(ret) => match id {
                             Id::EXIT => unsafe { (*processor).make_current_exited(ret) },
@@ -242,6 +299,7 @@ extern "C" fn rust_main() -> ! {
                             unsafe { (*processor).make_current_exited(-2) };
                         }
                     }
+                    } // end else gpu_ret
                 }
                 // ─── 其他异常/中断：杀死进程 ───
                 e => {

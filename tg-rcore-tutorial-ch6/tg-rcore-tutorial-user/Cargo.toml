@@ -334,6 +334,10 @@ path = "src/bin/threads_arg.rs"
 name = "user_shell"
 path = "src/bin/user_shell.rs"
 
+[[bin]]
+name = "breakout"
+path = "src/bin/breakout.rs"
+
 [dependencies.customizable-buddy]
 version = "0.0.2"
 

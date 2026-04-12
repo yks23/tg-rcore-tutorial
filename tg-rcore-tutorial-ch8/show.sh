@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FS_IMG="$ROOT/target/riscv64gc-unknown-none-elf/debug/fs.img"
-KERNEL="$ROOT/target/riscv64gc-unknown-none-elf/debug/tg-rcore-tutorial-ch8-yks23-doom"
+KERNEL="$ROOT/target/riscv64gc-unknown-none-elf/debug/tg-rcore-tutorial-ch8-yks23"
 SCREENSHOT="$ROOT/screenshot-doom.ppm"
 MON_PORT=44408
 
@@ -21,7 +21,7 @@ case "$mode" in
   vnc)
     echo "=== ch8: VNC（127.0.0.1:5901）==="
     echo "编译内核..."
-    cargo build 2>&1 | tail -1
+    CHAPTER=game cargo build 2>&1 | tail -1
     if [[ ! -f "$FS_IMG" ]]; then
       echo "缺少磁盘镜像: $FS_IMG（请先在本目录执行 cargo build）" >&2
       exit 1
@@ -43,7 +43,7 @@ case "$mode" in
       exit 1
     fi
     echo "编译内核..."
-    cargo build 2>&1 | tail -1
+    CHAPTER=game cargo build 2>&1 | tail -1
     if [[ ! -f "$FS_IMG" ]]; then
       echo "缺少磁盘镜像: $FS_IMG" >&2
       exit 1
@@ -61,7 +61,7 @@ case "$mode" in
     echo "=== ch8: 自动演示（CHAPTER=game → doom + monitor 截图）==="
     export CHAPTER=game
     echo "编译（用户 initproc → doom）..."
-    cargo build 2>&1 | tail -1
+    CHAPTER=game cargo build 2>&1 | tail -1
     rm -f "$SCREENSHOT"
     echo "启动 QEMU (VirtIO-GPU, 无本地窗口)..."
     qemu-system-riscv64 \
@@ -101,7 +101,7 @@ case "$mode" in
     echo "=== ch8-doom: DOOM 风格演示 (VirtIO-GPU) ==="
     usage
     echo "编译内核..."
-    cargo build 2>&1 | tail -1
+    CHAPTER=game cargo build 2>&1 | tail -1
 
     rm -f "$SCREENSHOT"
 
