@@ -1,12 +1,12 @@
 [package]
-name = "tg-rcore-tutorial-ch1-yks23-tangram"
-description = "AI4OSE Lab1 T3L1: ch1 VirtIO-GPU tangram 'OS' pattern on RISC-V bare-metal. Kaisen Yang (yks23)."
-version = "0.4.8-preview.3"
+name = "tg-rcore-tutorial-ch1-yks23-t2l9"
+description = "rCore Tutorial ch1, yks23, T2L9 SMP multi-hart boot + T3L1 VirtIO-GPU tangram demo."
+version = "0.4.8-preview.1"
 edition = "2024"
 authors = ["Kaisen Yang <yks23@mails.tsinghua.edu.cn>","YdrMaster <ydrml@hotmail.com>","Yifan Wang<w-yf22@mails.tsinghua.edu.cn>","Yu Chen <yuchen@tsinghua.edu.cn>"]
 repository = "https://github.com/yks23/tg-rcore-tutorial"
 homepage = "https://github.com/yks23/tg-rcore-tutorial/tree/test/tg-rcore-tutorial-ch1"
-documentation = "https://docs.rs/tg-rcore-tutorial-ch1-yks23-tangram"
+documentation = "https://docs.rs/tg-rcore-tutorial-ch1-yks23-t2l9"
 license = "GPL-3.0"
 readme = "README.md"
 keywords = ["ai", "ai4ose", "kernel", "learning", "os"]
