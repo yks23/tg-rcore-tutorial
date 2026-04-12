@@ -101,6 +101,34 @@ pub fn count_syscall(syscall_id: usize) -> isize {
     trace(2, syscall_id, 0)
 }
 
+/// GPU syscall 622: 将帧缓冲数据（BGRA 格式）刷新到屏幕
+pub fn draw_framebuffer(buf: &[u8], w: u32, h: u32) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") buf.as_ptr() as usize => ret,
+            in("a1") w as usize,
+            in("a2") h as usize,
+            in("a7") 622usize,
+        )
+    }
+    ret
+}
+
+/// GPU syscall 623: 获取屏幕分辨率（[width, height]）
+pub fn get_fb_info(out: &mut [u32; 2]) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") out.as_mut_ptr() as usize => ret,
+            in("a7") 623usize,
+        )
+    }
+    ret
+}
+
 /// 从管道读取数据
 /// 返回实际读取的总字节数，负数表示错误
 pub fn pipe_read(pipe_fd: usize, buffer: &mut [u8]) -> isize {

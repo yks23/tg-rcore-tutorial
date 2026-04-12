@@ -4,7 +4,7 @@ set -euo pipefail
 # 使用绝对路径：QEMU 对 -drive file= 中含「可执行文件名/../fs.img」的解析会触发 ENOTDIR。
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FS_IMG="$ROOT/target/riscv64gc-unknown-none-elf/debug/fs.img"
-KERNEL="$ROOT/target/riscv64gc-unknown-none-elf/debug/tg-rcore-tutorial-ch6-yks23-breakout"
+KERNEL="$ROOT/target/riscv64gc-unknown-none-elf/debug/tg-rcore-tutorial-ch6-yks23"
 SCREENSHOT="$ROOT/screenshot-breakout.ppm"
 MON_PORT=44406
 
@@ -21,7 +21,7 @@ mode="${1:-default}"
 case "$mode" in
   vnc)
     echo "=== ch6: VNC（127.0.0.1:5901）==="
-    cargo build 2>&1 | tail -1
+    CHAPTER=game cargo build 2>&1 | tail -1
     if [[ ! -f "$FS_IMG" ]]; then
       echo "缺少磁盘镜像: $FS_IMG（请先在本目录执行 cargo build）" >&2
       exit 1
@@ -42,7 +42,7 @@ case "$mode" in
       echo "远程可用: $0 vnc" >&2
       exit 1
     fi
-    cargo build 2>&1 | tail -1
+    CHAPTER=game cargo build 2>&1 | tail -1
     if [[ ! -f "$FS_IMG" ]]; then
       echo "缺少磁盘镜像: $FS_IMG" >&2
       exit 1
@@ -85,7 +85,7 @@ case "$mode" in
     echo "=== ch6-breakout: 打砖块 (VirtIO-GPU) ==="
     usage
     echo "编译内核..."
-    cargo build 2>&1 | tail -1
+    CHAPTER=game cargo build 2>&1 | tail -1
 
     rm -f "$SCREENSHOT"
 

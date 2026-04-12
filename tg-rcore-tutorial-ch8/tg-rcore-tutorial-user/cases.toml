@@ -132,6 +132,12 @@ cases = [
     "initproc",
 ]
 
+[ch8_game]
+cases = [
+    "doom",
+    "initproc",
+]
+
 [ch8]
 cases = [
     "00hello_world",

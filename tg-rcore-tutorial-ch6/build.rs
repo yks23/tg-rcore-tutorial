@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TG_USER_LOCAL_DIR");
     println!("cargo:rerun-if-env-changed=TG_SKIP_USER_APPS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXERCISE");
+    println!("cargo:rerun-if-env-changed=CHAPTER");
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
@@ -82,6 +83,8 @@ fn build_apps_and_pack_fs() {
 
     let case_key = if env::var("CARGO_FEATURE_EXERCISE").is_ok() {
         "ch6_exercise"
+    } else if env::var("CHAPTER").as_deref() == Ok("game") {
+        "ch6_game"
     } else {
         "ch6"
     };
@@ -131,6 +134,10 @@ fn build_user_app(tg_user_root: &PathBuf, name: &str, base_address: u64) {
 
     if base_address != 0 {
         cmd.env("BASE_ADDRESS", base_address.to_string());
+    }
+    // 传递 CHAPTER 环境变量到用户程序构建（供 initproc 的 option_env! 读取）
+    if let Ok(chapter) = env::var("CHAPTER") {
+        cmd.env("CHAPTER", chapter);
     }
 
     let status = cmd.status().expect("failed to execute cargo build for user app");

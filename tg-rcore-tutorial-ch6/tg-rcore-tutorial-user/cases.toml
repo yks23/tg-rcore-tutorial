@@ -72,6 +72,12 @@ cases = [
     "initproc",
 ]
 
+[ch6_game]
+cases = [
+    "breakout",
+    "initproc",
+]
+
 [ch6]
 cases = [
     "00hello_world",
@@ -293,5 +299,6 @@ cases = [
     "ch8_deadlock_sem2",
     "ch8_usertest",
     "user_shell",
+    "breakout",
     "initproc",
 ]

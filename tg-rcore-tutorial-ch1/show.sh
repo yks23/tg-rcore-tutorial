@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KERNEL="$ROOT/target/riscv64gc-unknown-none-elf/debug/tg-rcore-tutorial-ch1-yks23-tangram"
+KERNEL="$ROOT/target/riscv64gc-unknown-none-elf/debug/tg-rcore-tutorial-ch1-yks23"
 SCREENSHOT="$ROOT/screenshot-tangram.ppm"
 MON_PORT=44401
 

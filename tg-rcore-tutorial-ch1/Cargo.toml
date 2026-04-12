@@ -21,3 +21,4 @@ panic = "abort"
 
 [dependencies]
 tg-sbi = { package = "tg-rcore-tutorial-sbi", path = "../tg-rcore-tutorial-sbi", version = "0.4.8", features = ["nobios"] }
+virtio-drivers = "0.1.0"
