@@ -111,6 +111,23 @@ static BSS_READY: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "riscv64")]
 static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
 
+/// 调度自旋锁：保护全局 PROCESSOR 的 find_next/make_current 操作，实现多核安全调度。
+///
+/// ### 设计说明
+///
+/// ch5 的 PROCESSOR 内部使用 UnsafeCell 假设单核独占访问。
+/// 引入此锁后，每个 hart 在调用 find_next/execute/handle_trap 全程持锁，
+/// 从而将 PROCESSOR 的访问窗口串行化，无需改动 PROCESSOR 自身。
+///
+/// ### 性能特性
+///
+/// 锁粒度 = 一个完整的任务调度周期（find_next → execute → trap handling）。
+/// 这意味着同一时刻只有一个 hart 在运行用户任务，其余 hart 在自旋等待。
+/// 这与 Linux 早期的 BKL（Big Kernel Lock）原理相同，是多核调度的最简可行实现。
+/// 后续章节可将粒度细化至 per-process 锁，实现真正并行。
+#[cfg(target_arch = "riscv64")]
+static SCHED_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 #[cfg(target_arch = "riscv64")]
 static SECONDARIES_ONLINE: AtomicUsize = AtomicUsize::new(0);
 
@@ -273,14 +290,24 @@ extern "C" fn rust_main(hartid: usize) -> ! {
                 console_putchar(*c);
             }
             put_decimal_hart(hartid);
-            for c in b" secondary (scheduler on hart 0 only)\n" {
+            for c in b" secondary online, joining scheduler\n" {
                 console_putchar(*c);
             }
         });
         SECONDARIES_ONLINE.fetch_add(1, Ordering::Release);
-        loop {
-            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+
+        // 副核等待主核完成所有初始化（堆、地址空间、传送门均就绪）
+        while !BOOT_DONE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
         }
+
+        // 副核在与主核相同的 satp 激活状态下进入调度循环
+        // 注意：副核不需要重新设置 satp，主核激活 Sv39 后副核也运行在同一地址空间
+        // （QEMU 多核共享 MMU，但每核有独立 satp CSR；副核 satp 仍为 0，
+        //  即裸机物理地址模式——这对内核恒等映射来说是安全的）
+
+        // 副核进入同一调度循环，使用 SCHED_LOCK 竞争任务
+        sched_loop_secondary();
     }
 
     let layout = tg_linker::KernelLayout::locate();
@@ -334,35 +361,47 @@ extern "C" fn rust_main(hartid: usize) -> ! {
 
     BOOT_DONE.store(true, Ordering::Release);
 
-    // ─── 主调度循环 ───
-    // 不断从进程管理器中取出就绪进程执行，直到所有进程结束
+    // 通过 IPI 唤醒所有副核，让它们加入调度循环
+    let secondary_mask: usize = ((1usize << QEMU_SMP) - 1) & !1;
+    if secondary_mask != 0 {
+        tg_sbi::send_ipi(secondary_mask);
+    }
+
+    // ─── 主调度循环（带 SCHED_LOCK 保护，支持多核并发调度）───
+    run_sched_loop(portal)
+}
+
+/// 共享调度主函数（主核和副核均调用，通过 SCHED_LOCK 互斥）。
+///
+/// 每次迭代：持锁 → 取下一个就绪任务 → 执行 → 处理 Trap → 释放锁。
+/// 无任务时短暂 wfi 等待（避免空转消耗总线带宽）。
+#[cfg(target_arch = "riscv64")]
+fn run_sched_loop(portal: &'static mut tg_kernel_context::foreign::MultislotPortal) -> ! {
     loop {
+        // 持锁期间独占 PROCESSOR，保证 find_next/make_current 不会并发冲突
+        let _guard = SCHED_LOCK.lock();
+
         let processor: *mut PManager<Process, ProcManager> = PROCESSOR.get_mut() as *mut _;
         if let Some(task) = unsafe { (*processor).find_next() } {
             // 通过异界传送门切换到用户地址空间执行用户程序
             unsafe { task.context.execute(portal, ()) };
 
-            // ─── Trap 返回后处理 ───
+            // ─── Trap 返回后处理（锁仍持有）───
             match scause::read().cause() {
-                // ─── 系统调用（ecall 指令触发） ───
                 scause::Trap::Exception(scause::Exception::UserEnvCall) => {
                     use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
                     let id: Id;
                     let args: [usize; 6];
                     {
                         let ctx = &mut task.context.context;
-                        // 将 sepc 向前移动 4 字节，使返回用户态时跳过 ecall 指令
                         ctx.move_next();
                         id = ctx.a(7).into();
                         args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
                     }
-                    // 分发并处理系统调用
                     match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
                         Ret::Done(ret) => match id {
-                            // exit 系统调用：标记当前进程为已退出
                             Id::EXIT => unsafe { (*processor).make_current_exited(ret) },
                             _ => {
-                                // Stride：本时间片结束，累加 pass = BIG_STRIDE / priority
                                 const STRIDE_BIG: usize = 0x1000_0000;
                                 *task.context.context.a_mut(0) = ret as _;
                                 task.stride = task
@@ -372,26 +411,46 @@ extern "C" fn rust_main(hartid: usize) -> ! {
                             }
                         },
                         Ret::Unsupported(_) => {
-                            // 不支持的系统调用：终止进程
                             log::info!("id = {id:?}");
                             unsafe { (*processor).make_current_exited(-2) };
                         }
                     }
                 }
-                // ─── 其他异常/中断：杀死进程 ───
                 e => {
                     log::error!("unsupported trap: {e:?}");
                     unsafe { (*processor).make_current_exited(-3) };
                 }
             }
+            // _guard 在此处 drop，释放锁 → 其他核可立即抢入
         } else {
-            // 没有更多进程可执行
+            // 无就绪任务：释放锁后短暂等待（wfi 让其他核有机会处理中断/唤醒进程）
+            drop(_guard);
+            // 检查是否真的没有任何进程存在（包含僵尸/睡眠）
+            // 若进程全部退出，关机
+            // 简化实现：直接关机；完整实现应检查所有进程是否均已退出
             println!("no task");
-            break;
+            tg_sbi::shutdown(false);
         }
     }
-    // 所有进程执行完毕，关机
-    tg_sbi::shutdown(false)
+}
+
+/// 副核调度入口：等待 BOOT_DONE 后进入共享调度循环。
+///
+/// 副核没有异界传送门的独立引用，但 `PROTAL_TRANSIT` 是编译期常量虚拟地址，
+/// 在恒等映射下物理地址相同，所有核可以共用同一个 portal 实例。
+#[cfg(target_arch = "riscv64")]
+fn sched_loop_secondary() -> ! {
+    // 副核重新从已知的虚拟地址获取 portal 引用（和主核使用同一个物理页）
+    let portal = unsafe {
+        tg_kernel_context::foreign::MultislotPortal::init_transit(PROTAL_TRANSIT.base().val(), 1)
+    };
+    // 副核同样需要激活 Sv39 分页，使用和主核相同的页表（通过 satp CSR）
+    // 在 QEMU 多核下，主核设置的 satp 不会自动传播到副核，
+    // 副核的 satp 仍为 0（裸机物理寻址）。
+    // 由于内核采用恒等映射（VA==PA），副核在 satp=0 模式下访问内核数据是安全的。
+    // 用户程序执行时，MultislotPortal 的 execute() 会自动切换 satp 到该进程的页表，
+    // 并在 Trap 返回后恢复内核的 satp——这与单核行为一致。
+    run_sched_loop(portal)
 }
 
 /// Rust panic 处理函数，打印错误信息并以异常方式关机

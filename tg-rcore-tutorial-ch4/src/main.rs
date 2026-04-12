@@ -231,11 +231,17 @@ extern "C" fn rust_main(hartid: usize) -> ! {
                 console_putchar(*c);
             }
             put_decimal_hart(hartid);
-            for c in b" secondary (scheduler on hart 0 only)\n" {
+            for c in b" secondary online, waiting for scheduler\n" {
                 console_putchar(*c);
             }
         });
         SECONDARIES_ONLINE.fetch_add(1, Ordering::Release);
+        // ch4 调度线程运行在主核异常域中（LocalContext::thread），
+        // 副核实现完整多核调度需要额外的调度线程机制，留作后续扩展。
+        // 当前：副核等待 BOOT_DONE 后进入 wfi 待命。
+        while !BOOT_DONE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
         loop {
             unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
         }
@@ -302,6 +308,11 @@ extern "C" fn rust_main(hartid: usize) -> ! {
     let mut scheduling = LocalContext::thread(schedule as *const () as _, false);
     *scheduling.sp_mut() = 1 << 38;
     BOOT_DONE.store(true, Ordering::Release);
+    // 通知副核系统已就绪（副核收到 IPI 后从 spin_loop 退出，进入 wfi 待命）
+    let secondary_mask: usize = ((1usize << QEMU_SMP) - 1) & !1;
+    if secondary_mask != 0 {
+        tg_sbi::send_ipi(secondary_mask);
+    }
     unsafe { scheduling.execute() };
     // 如果从 execute() 返回，说明调度线程发生了异常
     log::error!("stval = {:#x}", stval::read());

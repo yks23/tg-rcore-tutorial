@@ -66,6 +66,8 @@ mod eid {
     pub const BASE: usize = 0x10;
     pub const SRST: usize = 0x53525354;
     pub const TIMER: usize = 0x54494D45;
+    /// SBI IPI 扩展（EID=0x735049）：核间中断，用于唤醒正在 wfi 的副核。
+    pub const IPI: usize = 0x735049;
 }
 
 /// SBI 功能 ID。
@@ -133,6 +135,30 @@ fn handle_console_getchar() -> SbiRet {
             continue;
         }
     }
+}
+
+/// 处理 IPI 扩展（EID 0x735049）：向目标 hart 发送核间中断，唤醒其 wfi 睡眠。
+///
+/// RISC-V CLINT 的 MSIP 寄存器布局（QEMU virt 平台）：
+/// - 基地址 0x200_0000，每个 hart 占 4 字节
+/// - 写入 1 → 触发该 hart 的 M 态软件中断（MSIP）
+/// - 写入 0 → 清除
+///
+/// 由于 tg-sbi 将所有中断委托给 S 态，副核在 wfi 时可被此中断唤醒。
+///
+/// `a0` = hart_mask（位图：bit N=1 表示向 hart N 发送 IPI）
+fn handle_ipi(hart_mask: usize) -> SbiRet {
+    const CLINT_MSIP_BASE: usize = 0x200_0000;
+    for hart_id in 0..8usize {
+        if hart_mask & (1 << hart_id) != 0 {
+            unsafe {
+                // 向目标 hart 的 MSIP 寄存器写 1 触发软件中断
+                let msip = (CLINT_MSIP_BASE + hart_id * 4) as *mut u32;
+                msip.write_volatile(1);
+            }
+        }
+    }
+    SbiRet::success(0)
 }
 
 /// 处理 Timer 扩展（EID 0x54494D45）。
@@ -242,6 +268,7 @@ pub fn m_trap_handler(
         eid::SHUTDOWN => handle_system_reset(fid::SRST_SHUTDOWN),
         eid::BASE => handle_base(fid),
         eid::SRST => handle_system_reset(fid),
+        eid::IPI => handle_ipi(a0),
         _ => SbiRet::not_supported(),
     }
 }

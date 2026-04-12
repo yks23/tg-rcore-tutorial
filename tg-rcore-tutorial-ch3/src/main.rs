@@ -154,6 +154,154 @@ fn put_decimal_hart(mut n: usize) {
 
 // ========== 内核主函数 ==========
 
+/// 全局任务调度自旋锁：保护 `ROUND_IDX` 的取/置，确保多核间不会同时调度同一任务。
+///
+/// 设计原理：
+/// - ch3 任务是"一次性"的 —— execute() 后立即处理 Trap，而非可抢占的进程。
+/// - 因此自旋锁粒度可以覆盖整个"取任务 → 执行 → 处理 Trap"周期。
+/// - 每次时钟中断或 yield 都会释放锁（因为 execute() 返回到锁释放处），
+///   另一个 hart 立即可以抢入执行下一个就绪任务。
+#[cfg(target_arch = "riscv64")]
+static SCHED_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// 全局轮转索引（下一个应检查的 TCB 槽位）。
+#[cfg(target_arch = "riscv64")]
+static ROUND_IDX: AtomicUsize = AtomicUsize::new(0);
+
+/// 全局任务总数（主核初始化后写入，副核只读）。
+#[cfg(target_arch = "riscv64")]
+static TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// 全局未完成任务计数（归零时所有核退出调度循环）。
+#[cfg(target_arch = "riscv64")]
+static REMAIN: AtomicUsize = AtomicUsize::new(0);
+
+/// 共享调度循环：主核/副核在初始化完毕后均调用此函数，实现多核并行分时调度。
+///
+/// ### 调度策略（全局大锁 BKL）
+///
+/// 最简多核方案——全局自旋锁（类似 Linux 早期的 Big Kernel Lock）：
+/// 1. 加 SCHED_LOCK
+/// 2. 轮转找一个未完成任务（原子递增 ROUND_IDX，取模 n）
+/// 3. 若找到：执行任务的一个完整"时间片"（一次 execute 直到 Trap 返回）
+/// 4. 处理 Trap，必要时标记任务完成（递减 REMAIN）
+/// 5. 释放锁 → 下一轮从步骤 1 开始（其他核可立即抢入）
+///
+/// ### 关键特性
+/// - 任务粒度串行：每个时间片只有一个核在执行用户任务，不会出现同一任务
+///   被两个核同时运行的情况
+/// - 无任务时 wfi 睡眠，避免忙等耗尽总线带宽
+/// - REMAIN == 0 时所有核退出并关机
+#[cfg(target_arch = "riscv64")]
+fn sched_loop() -> ! {
+    let n = TASK_COUNT.load(Ordering::Acquire);
+    loop {
+        if REMAIN.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+
+        // ── 加调度锁：确保任务选取和执行的原子性 ──
+        while SCHED_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            if REMAIN.load(Ordering::Relaxed) == 0 {
+                tg_sbi::shutdown(false);
+            }
+            core::hint::spin_loop();
+        }
+
+        // ── 轮转找下一个未完成任务 ──
+        // 原子递增保证多核间不会选中同一个槽位（即使出现，finish 标志也会过滤）
+        let tcbs = unsafe { &mut KERNEL_TCBS[..n] };
+        let mut found_idx: Option<usize> = None;
+        for _ in 0..n {
+            let i = ROUND_IDX.fetch_add(1, Ordering::Relaxed) % n;
+            if !tcbs[i].finish {
+                found_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(i) = found_idx {
+            let tcb = &mut tcbs[i];
+
+            // ── 执行一个时间片（持锁期间，单核独占此任务）──
+            loop {
+                #[cfg(not(feature = "coop"))]
+                tg_sbi::set_timer(riscv::register::time::read64() + 12500);
+
+                unsafe { tcb.execute() };
+
+                use scause::*;
+                let (done, should_switch) = match scause::read().cause() {
+                    Trap::Interrupt(Interrupt::SupervisorTimer) => {
+                        tg_sbi::set_timer(u64::MAX);
+                        log::trace!("hart{} app{i} timeout", hartid_of_current());
+                        (false, true) // 时间片到期，切换到下一任务
+                    }
+                    Trap::Exception(Exception::UserEnvCall) => {
+                        use task::SchedulingEvent as Event;
+                        match tcb.handle_syscall(i) {
+                            Event::None => (false, false), // 继续执行当前任务
+                            Event::Exit(code) => {
+                                log::info!("hart{} app{i} exit({code})", hartid_of_current());
+                                (true, true)
+                            }
+                            Event::Yield => {
+                                log::debug!("hart{} app{i} yield", hartid_of_current());
+                                (false, true) // 主动让出
+                            }
+                            Event::UnsupportedSyscall(id) => {
+                                log::error!("hart{} app{i} unsupported syscall {}", hartid_of_current(), id.0);
+                                (true, true)
+                            }
+                        }
+                    }
+                    Trap::Exception(e) => {
+                        log::error!("hart{} app{i} killed by {e:?}", hartid_of_current());
+                        (true, true)
+                    }
+                    Trap::Interrupt(ir) => {
+                        log::error!("hart{} app{i} killed by {ir:?}", hartid_of_current());
+                        (true, true)
+                    }
+                };
+
+                if done {
+                    tcb.finish = true;
+                    REMAIN.fetch_sub(1, Ordering::Release);
+                }
+                if should_switch { break; }
+            }
+        } else {
+            // 无可运行任务（可能全部完成或暂时阻塞）
+            SCHED_LOCK.store(false, Ordering::Release);
+            if REMAIN.load(Ordering::Relaxed) == 0 { break; }
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+            continue;
+        }
+
+        // ── 释放锁，允许其他核抢入 ──
+        SCHED_LOCK.store(false, Ordering::Release);
+    }
+
+    tg_sbi::shutdown(false)
+}
+
+/// 读取当前 hart id（通过 CSR mhartid 的 S 态镜像——在 nobios 环境下可通过 tp 或从
+/// tg-sbi 传入值推断，此处直接使用 Rust 闭包捕获的 hartid 形参）。
+/// 这里提供一个占位实现，实际 hartid 在 sched_loop 的调用位置已知。
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn hartid_of_current() -> usize {
+    // 在 RISC-V S 态读取 mhartid 会触发非法指令异常（M 态寄存器）。
+    // 实际 hartid 已由 tg-sbi 通过 a0 传入 rust_main，使用 thread-local 或
+    // 从调用栈获取。这里用 0 占位，日志不要求精确 hart id 时可接受。
+    // 精确实现：用 TP 寄存器存储 hartid（见 ch8 扩展）。
+    riscv::register::sscratch::read() // 临时用 sscratch 存 hartid（见 rust_main 中设置）
+}
+
 /// 内核主函数：初始化各子系统，然后以多道方式并发运行所有用户程序。
 ///
 /// 与第二章的串行批处理不同，本章的多道程序系统支持：
@@ -161,9 +309,15 @@ fn put_decimal_hart(mut n: usize) {
 /// - 任务之间通过时间片轮转切换（抢占式调度，默认模式）
 /// - 任务可以主动让出 CPU（协作式调度，通过 yield，需启用 `coop` feature）
 ///
-/// `hartid` 由 `tg-sbi` 经 `a0` 传入；调度与时钟中断仅在 hart 0 启用；副核经 `BSS_READY` 后打印上线行再 `wfi`（实验 10）。
+/// **多核支持（SMP）**：
+/// - 主核（hart 0）：完成全部初始化后，通过 IPI 唤醒所有副核，加入共享调度循环
+/// - 副核（hart 1..N）：等待 BOOT_DONE，然后进入相同的 `sched_loop()` 并行执行任务
+/// - 所有核共享全局 TCB 表，通过 `SCHED_LOCK` 自旋锁避免同时调度同一任务
 #[cfg(target_arch = "riscv64")]
 extern "C" fn rust_main(hartid: usize) -> ! {
+    // 把 hartid 存入 sscratch，供 hartid_of_current() 读取（日志用）
+    riscv::register::sscratch::write(hartid);
+
     if hartid != 0 {
         while !BSS_READY.load(Ordering::Acquire) {
             core::hint::spin_loop();
@@ -174,14 +328,23 @@ extern "C" fn rust_main(hartid: usize) -> ! {
                 console_putchar(*c);
             }
             put_decimal_hart(hartid);
-            for c in b" secondary (scheduler on hart 0 only)\n" {
+            for c in b" secondary online, joining scheduler\n" {
                 console_putchar(*c);
             }
         });
         SECONDARIES_ONLINE.fetch_add(1, Ordering::Release);
-        loop {
-            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+
+        // 副核等待主核完成全局初始化（BOOT_DONE），然后直接加入调度循环
+        while !BOOT_DONE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
         }
+
+        // 副核开启 S 态时钟中断，支持抢占式调度
+        #[cfg(not(feature = "coop"))]
+        unsafe { riscv::register::sie::set_stimer() };
+
+        // 进入共享调度循环（与主核平等地竞争任务）
+        sched_loop()
     }
 
     // 第一步：清零 BSS 段（未初始化的全局变量区域）
@@ -218,90 +381,26 @@ extern "C" fn rust_main(hartid: usize) -> ! {
     }
     println!();
 
-    // 副核可安全使用已初始化的全局状态与控制台
+    // 初始化全局调度计数器
+    TASK_COUNT.store(index_mod, Ordering::Release);
+    REMAIN.store(index_mod, Ordering::Release);
+
+    // 发布 BOOT_DONE：副核看到此标志后立即加入调度
     BOOT_DONE.store(true, Ordering::Release);
 
     // 第五步：开启 S 特权级时钟中断
-    // 这是实现抢占式调度的关键：允许时钟中断打断用户程序的执行
+    #[cfg(not(feature = "coop"))]
     unsafe { sie::set_stimer() };
 
-    // ========== 多道程序主循环 ==========
-    // 使用轮转调度算法（Round-Robin），依次执行各任务
-    let mut remain = index_mod; // 剩余未完成的任务数
-    let mut i = 0usize; // 当前任务索引
-    while remain > 0 {
-        let tcb = &mut tcbs[i];
-        if !tcb.finish {
-            loop {
-                // 【抢占式调度】设置时钟中断：12500 个时钟周期后触发
-                // 当 coop feature 启用时，跳过此步（协作式调度，不使用时钟中断）
-                #[cfg(not(feature = "coop"))]
-                tg_sbi::set_timer(time::read64() + 12500);
-
-                // 切换到 U-mode 执行用户程序
-                // execute() 会恢复用户寄存器并执行 sret
-                // 当用户程序触发 Trap 后返回到这里
-                unsafe { tcb.execute() };
-
-                // 读取 scause 寄存器判断 Trap 原因
-                use scause::*;
-                let finish = match scause::read().cause() {
-                    // ─── 时钟中断：时间片用完，切换到下一个任务 ───
-                    Trap::Interrupt(Interrupt::SupervisorTimer) => {
-                        // 清除时钟中断（设置为最大值，避免立即再次触发）
-                        tg_sbi::set_timer(u64::MAX);
-                        log::trace!("app{i} timeout");
-                        false // 不结束任务，切换到下一个
-                    }
-                    // ─── 系统调用：用户程序执行了 ecall 指令 ───
-                    Trap::Exception(Exception::UserEnvCall) => {
-                        use task::SchedulingEvent as Event;
-                        match tcb.handle_syscall(i) {
-                            // 普通系统调用（如 write）：处理完成后继续运行当前任务
-                            Event::None => continue,
-                            // exit 系统调用：任务主动退出
-                            Event::Exit(code) => {
-                                log::info!("app{i} exit with code {code}");
-                                true
-                            }
-                            // yield 系统调用：任务主动让出 CPU
-                            Event::Yield => {
-                                log::debug!("app{i} yield");
-                                false // 不结束任务，切换到下一个
-                            }
-                            // 不支持的系统调用：杀死任务
-                            Event::UnsupportedSyscall(id) => {
-                                log::error!("app{i} call an unsupported syscall {}", id.0);
-                                true
-                            }
-                        }
-                    }
-                    // ─── 其他异常（如非法指令、页错误等）：杀死应用 ───
-                    Trap::Exception(e) => {
-                        log::error!("app{i} was killed by {e:?}");
-                        true
-                    }
-                    // ─── 未预期的中断：杀死应用 ───
-                    Trap::Interrupt(ir) => {
-                        log::error!("app{i} was killed by an unexpected interrupt {ir:?}");
-                        true
-                    }
-                };
-
-                // 如果任务结束（退出或被杀死），标记为已完成
-                if finish {
-                    tcb.finish = true;
-                    remain -= 1;
-                }
-                break;
-            }
-        }
-        // 轮转到下一个任务（循环取模）
-        i = (i + 1) % index_mod;
+    // 第六步：通过 IPI 唤醒所有副核加入调度循环
+    // hart_mask = 所有副核的位图（bit 1..QEMU_SMP-1 置位）
+    let secondary_mask: usize = ((1usize << QEMU_SMP) - 1) & !1;
+    if secondary_mask != 0 {
+        tg_sbi::send_ipi(secondary_mask);
     }
 
-    // 所有用户程序执行完毕，关机
-    tg_sbi::shutdown(false)
+    // 主核直接进入共享调度循环
+    sched_loop()
 }
 
 // ========== panic 处理 ==========

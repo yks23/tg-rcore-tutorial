@@ -58,6 +58,7 @@ const SBI_CONSOLE_GETCHAR: usize = 2;
 // SBI 扩展 ID
 const SBI_EXT_TIMER: usize = 0x54494D45;
 const SBI_EXT_SRST: usize = 0x53525354;
+const SBI_EXT_IPI: usize = 0x735049;
 
 /// SBI `ecall` 的寄存器约定（RISC-V）：
 ///
@@ -131,6 +132,16 @@ fn sbi_call(_eid: usize, _fid: usize, _arg0: usize, _arg1: usize, _arg2: usize) 
 /// 内核章节通常在每次调度前调用它，形成时间片中断。
 pub fn set_timer(timer: u64) {
     sbi_call(SBI_EXT_TIMER, 0, timer as usize, 0, 0);
+}
+
+/// 向目标 hart 发送核间中断（IPI），将其从 `wfi` 睡眠中唤醒。
+///
+/// `hart_mask` 是位图：bit N = 1 表示向 hart N 发送 IPI。
+/// 例如唤醒 hart 1 和 hart 2：`send_ipi(0b110)`。
+///
+/// 基于 SBI IPI 扩展（EID 0x735049，FID 0）。
+pub fn send_ipi(hart_mask: usize) {
+    sbi_call(SBI_EXT_IPI, 0, hart_mask, 0, 0);
 }
 
 /// 向调试控制台输出一个字符。

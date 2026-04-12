@@ -153,7 +153,7 @@ extern "C" fn rust_main(hartid: usize) -> ! {
                 console_putchar(*c);
             }
             put_decimal_hart(hartid);
-            for c in b" secondary (batch on hart 0 only)\n" {
+            for c in b" secondary online (batch processing: sequential by design)\n" {
                 console_putchar(*c);
             }
         });
