@@ -10,7 +10,6 @@
 extern crate alloc;
 extern crate user_lib;
 
-use alloc::vec::Vec;
 use user_lib::{draw_framebuffer, get_fb_info, get_time, sched_yield};
 
 // ─── 颜色常量（BGRA 格式）─────────────────────────────────────────────────────
@@ -36,22 +35,31 @@ const BALL_R: i32 = 7;
 const TARGET_FPS: i64 = 30;
 const FRAME_MS: i64 = 1000 / TARGET_FPS;
 
-// ─── 帧缓冲结构 ───────────────────────────────────────────────────────────────
+// ─── 帧缓冲（静态，避免大块堆分配）──────────────────────────────────────────
+// 最大分辨率 1280×800，BGRA 格式
+const FB_MAX_W: u32 = 1280;
+const FB_MAX_H: u32 = 800;
+const FB_MAX_PIXELS: usize = (FB_MAX_W * FB_MAX_H) as usize;
+
+#[repr(C, align(4096))]
+struct StaticFb([u32; FB_MAX_PIXELS]);
+static mut FB_DATA: StaticFb = StaticFb([0u32; FB_MAX_PIXELS]);
 
 struct Fb {
-    buf: Vec<u32>,
     w: u32,
     h: u32,
 }
 
 impl Fb {
     fn new(w: u32, h: u32) -> Self {
-        Fb { buf: alloc::vec![0u32; (w * h) as usize], w, h }
+        Fb { w: w.min(FB_MAX_W), h: h.min(FB_MAX_H) }
     }
 
+    #[inline]
     fn set(&mut self, x: i32, y: i32, color: u32) {
-        if x >= 0 && y >= 0 && x < self.w as i32 && y < self.h as i32 {
-            self.buf[(y as u32 * self.w + x as u32) as usize] = color;
+        if x >= 0 && y >= 0 && (x as u32) < self.w && (y as u32) < self.h {
+            let ptr = (&raw mut FB_DATA) as *mut u32;
+            unsafe { ptr.add((y as u32 * self.w + x as u32) as usize).write(color); }
         }
     }
 
@@ -74,14 +82,17 @@ impl Fb {
     }
 
     fn clear(&mut self) {
-        for p in self.buf.iter_mut() {
-            *p = BG;
+        let n = (self.w * self.h) as usize;
+        let ptr = (&raw mut FB_DATA) as *mut u32;
+        unsafe {
+            for i in 0..n { ptr.add(i).write(BG); }
         }
     }
 
     fn flush(&self) -> isize {
+        let ptr = (&raw const FB_DATA) as *const u8;
         let bytes = unsafe {
-            core::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.buf.len() * 4)
+            core::slice::from_raw_parts(ptr, (self.w * self.h * 4) as usize)
         };
         draw_framebuffer(bytes, self.w, self.h)
     }
@@ -261,10 +272,10 @@ fn main() -> i32 {
 
 /// 用小矩形点阵显示分数（右上角）
 fn draw_score(fb: &mut Fb, score: u32, x: i32, y: i32) {
-    let digits = score_digits(score);
+    let (digits, len) = score_digits(score);
     let mut cx = x;
-    for d in digits {
-        draw_digit(fb, cx, y, d, TEXT_COLOR);
+    for i in 0..len {
+        draw_digit(fb, cx, y, digits[i], TEXT_COLOR);
         cx += 10;
     }
 }
@@ -276,14 +287,14 @@ fn draw_lives(fb: &mut Fb, lives: u32, x: i32, y: i32) {
     }
 }
 
-fn score_digits(mut n: u32) -> alloc::vec::Vec<u8> {
-    if n == 0 { return alloc::vec![0]; }
-    let mut v = alloc::vec![];
-    while n > 0 {
-        v.insert(0, (n % 10) as u8);
-        n /= 10;
-    }
-    v
+fn score_digits(mut n: u32) -> ([u8; 10], usize) {
+    let mut digits = [0u8; 10];
+    if n == 0 { return (digits, 1); }
+    let mut len = 0;
+    let mut tmp = [0u8; 10];
+    while n > 0 { tmp[len] = (n % 10) as u8; len += 1; n /= 10; }
+    for i in 0..len { digits[i] = tmp[len - 1 - i]; }
+    (digits, len)
 }
 
 /// 5×7 点阵数字（超简化版）

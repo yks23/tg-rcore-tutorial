@@ -117,7 +117,7 @@ unsafe extern "C" fn _start() -> ! {
 }
 
 /// 物理内存容量 = 48 MiB
-const MEMORY: usize = 48 << 20;
+const MEMORY: usize = 96 << 20; // ch6-game 需要更大内存（GPU framebuffer 占 4MB）
 
 /// 异界传送门所在虚页（虚拟地址空间最高页）
 const PROTAL_TRANSIT: VPN<Sv39> = VPN::MAX;
@@ -155,9 +155,12 @@ static KERNEL_SPACE: KernelSpace = KernelSpace::new();
 /// QEMU virt 平台上 VirtIO 块设备的 MMIO 基地址为 0x1000_1000，大小 0x1000。
 /// VirtIO GPU 设备占用 0x1000_8000（第一个 -device virtio-gpu-device 分配到最高 slot）。
 /// 需要在内核地址空间中进行恒等映射，以便驱动程序访问。
+/// VirtIO MMIO 设备地址范围
+///
+/// 覆盖全部 8 个 VirtIO MMIO slot（0x10001000..0x10009000），
+/// 内核可通过扫描各 slot 来查找块设备和 GPU 设备。
 pub const MMIO: &[(usize, usize)] = &[
-    (0x1000_1000, 0x00_1000), // VirtIO 块设备
-    (virtio_gpu::GPU_MMIO.0, virtio_gpu::GPU_MMIO.1), // VirtIO GPU
+    (virtio_gpu::GPU_MMIO.0, virtio_gpu::GPU_MMIO.1),
 ];
 
 /// 内核主函数——系统初始化和启动入口

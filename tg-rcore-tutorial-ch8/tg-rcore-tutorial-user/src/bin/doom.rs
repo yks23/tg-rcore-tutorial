@@ -9,7 +9,6 @@
 extern crate alloc;
 extern crate user_lib;
 
-use alloc::vec::Vec;
 use user_lib::{draw_framebuffer, get_fb_info, get_time, sched_yield};
 
 // ─── 地图 ─────────────────────────────────────────────────────────────────────
@@ -94,22 +93,30 @@ const FLOOR: u32 = 0xFF504030;
 const WALL_NS: u32 = 0xFF2060C0;
 const WALL_EW: u32 = 0xFF1040A0;
 
-// ─── 帧缓冲 ───────────────────────────────────────────────────────────────────
+// ─── 帧缓冲（静态，避免大块堆分配）──────────────────────────────────────────
+const FB_MAX_W: u32 = 1280;
+const FB_MAX_H: u32 = 800;
+const FB_MAX_PIXELS: usize = (FB_MAX_W * FB_MAX_H) as usize;
+
+#[repr(C, align(4096))]
+struct StaticFb([u32; FB_MAX_PIXELS]);
+static mut FB_DATA: StaticFb = StaticFb([0u32; FB_MAX_PIXELS]);
+
 struct Fb {
-    buf: Vec<u32>,
     w: u32,
     h: u32,
 }
 
 impl Fb {
     fn new(w: u32, h: u32) -> Self {
-        Fb { buf: alloc::vec![0u32; (w * h) as usize], w, h }
+        Fb { w: w.min(FB_MAX_W), h: h.min(FB_MAX_H) }
     }
 
     #[inline]
     fn set(&mut self, x: i32, y: i32, color: u32) {
         if x >= 0 && y >= 0 && (x as u32) < self.w && (y as u32) < self.h {
-            self.buf[(y as u32 * self.w + x as u32) as usize] = color;
+            let ptr = (&raw mut FB_DATA) as *mut u32;
+            unsafe { ptr.add((y as u32 * self.w + x as u32) as usize).write(color); }
         }
     }
 
@@ -130,8 +137,9 @@ impl Fb {
     }
 
     fn flush(&self) -> isize {
+        let ptr = (&raw const FB_DATA) as *const u8;
         let bytes = unsafe {
-            core::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.buf.len() * 4)
+            core::slice::from_raw_parts(ptr, (self.w * self.h * 4) as usize)
         };
         draw_framebuffer(bytes, self.w, self.h)
     }
@@ -238,12 +246,12 @@ fn main() -> i32 {
             for _ in 0..MAX_STEPS {
                 if sdx < sdy {
                     dist_fp = sdx;
-                    sdx += dx_per_cell;
+                    sdx = sdx.saturating_add(dx_per_cell);
                     mx += step_mx;
                     side = 0;
                 } else {
                     dist_fp = sdy;
-                    sdy += dy_per_cell;
+                    sdy = sdy.saturating_add(dy_per_cell);
                     my += step_my;
                     side = 1;
                 }

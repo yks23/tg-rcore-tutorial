@@ -131,7 +131,7 @@ unsafe extern "C" fn _start() -> ! {
 }
 
 /// 物理内存容量 = 48 MiB
-const MEMORY: usize = 48 << 20;
+const MEMORY: usize = 96 << 20; // ch8-game 需要更大内存（GPU framebuffer 占 4MB）
 /// 异界传送门所在虚页
 const PROTAL_TRANSIT: VPN<Sv39> = VPN::MAX;
 
@@ -162,9 +162,9 @@ impl KernelSpace {
 static KERNEL_SPACE: KernelSpace = KernelSpace::new();
 
 /// VirtIO MMIO 设备地址范围
+/// VirtIO MMIO 设备地址范围（覆盖全部 8 个 slot，含块设备和 GPU）
 pub const MMIO: &[(usize, usize)] = &[
-    (0x1000_1000, 0x00_1000), // VirtIO 块设备
-    (virtio_gpu::GPU_MMIO.0, virtio_gpu::GPU_MMIO.1), // VirtIO GPU
+    (virtio_gpu::GPU_MMIO.0, virtio_gpu::GPU_MMIO.1),
 ];
 
 /// 内核主函数
