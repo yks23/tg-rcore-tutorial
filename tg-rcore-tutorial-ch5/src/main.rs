@@ -172,6 +172,17 @@ unsafe extern "C" fn _start() -> ! {
     )
 }
 
+/// 向目标 hart 发送 IPI（写 CLINT msip 寄存器，基地址 0x200_0000，每核 4 字节）。
+#[cfg(target_arch = "riscv64")]
+fn send_ipi_clint(hart_mask: usize) {
+    const CLINT_MSIP_BASE: usize = 0x200_0000;
+    for hart_id in 0..8usize {
+        if hart_mask & (1 << hart_id) != 0 {
+            unsafe { ((CLINT_MSIP_BASE + hart_id * 4) as *mut u32).write_volatile(1) };
+        }
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 fn with_console_lock(mut f: impl FnMut()) {
     while CONSOLE_LOCK
@@ -364,7 +375,7 @@ extern "C" fn rust_main(hartid: usize) -> ! {
     // 通过 IPI 唤醒所有副核，让它们加入调度循环
     let secondary_mask: usize = ((1usize << QEMU_SMP) - 1) & !1;
     if secondary_mask != 0 {
-        tg_sbi::send_ipi(secondary_mask);
+        send_ipi_clint(secondary_mask);
     }
 
     // ─── 主调度循环（带 SCHED_LOCK 保护，支持多核并发调度）───

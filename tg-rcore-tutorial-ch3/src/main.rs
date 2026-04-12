@@ -120,6 +120,18 @@ unsafe extern "C" fn _start() -> ! {
 }
 
 #[cfg(target_arch = "riscv64")]
+/// 通过直接写 CLINT msip 寄存器向目标 hart 发送核间中断（IPI），唤醒 wfi 中的副核。
+/// QEMU virt 平台 CLINT msip 基地址 0x200_0000，每核 4 字节，写 1 触发 M 态软件中断。
+#[cfg(target_arch = "riscv64")]
+fn send_ipi_clint(hart_mask: usize) {
+    const CLINT_MSIP_BASE: usize = 0x200_0000;
+    for hart_id in 0..8usize {
+        if hart_mask & (1 << hart_id) != 0 {
+            unsafe { ((CLINT_MSIP_BASE + hart_id * 4) as *mut u32).write_volatile(1) };
+        }
+    }
+}
+
 fn with_console_lock(mut f: impl FnMut()) {
     while CONSOLE_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -396,7 +408,7 @@ extern "C" fn rust_main(hartid: usize) -> ! {
     // hart_mask = 所有副核的位图（bit 1..QEMU_SMP-1 置位）
     let secondary_mask: usize = ((1usize << QEMU_SMP) - 1) & !1;
     if secondary_mask != 0 {
-        tg_sbi::send_ipi(secondary_mask);
+        send_ipi_clint(secondary_mask);
     }
 
     // 主核直接进入共享调度循环
